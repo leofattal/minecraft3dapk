@@ -1,0 +1,4 @@
+// Local module that exposes the LeiaSR (CNSDK) AAR to the app.
+// See README.md for the origin and licensing situation of this artifact.
+configurations.maybeCreate("default")
+artifacts.add("default", file("sdk-faceTrackingService-0.7.28.aar"))

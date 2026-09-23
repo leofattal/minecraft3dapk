@@ -1,0 +1,62 @@
+plugins {
+    id "com.android.application"
+    id "org.jetbrains.kotlin.android"
+}
+
+android {
+    namespace "com.leofattal.mcweaver"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.leofattal.mcweaver"
+        minSdk 30          // CNSDK 0.6.167 requires >= 30; Lume Pad 2 is Android 12+
+        targetSdk 34
+        versionCode 10
+        versionName "1.9"
+
+        // The Lume Pad 2 is arm64; the QNN HTP skel ships arm64 only.
+        ndk { abiFilters += "arm64-v8a" }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug  // personal sideload convenience
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+
+    // Keep the depth model uncompressed so it can be mmap'd.
+    androidResources { noCompress += "tflite" }
+
+    packaging {
+        jniLibs {
+            pickFirsts += "**/libc++_shared.so"
+            // Extract .so files: Hexagon fastrpc loads libQnnHtpV68Skel.so by
+            // filesystem path and cannot read inside the APK.
+            useLegacyPackaging = true
+        }
+    }
+
+    lint { abortOnError false }
+}
+
+dependencies {
+    implementation "androidx.appcompat:appcompat:1.6.1"
+    implementation "androidx.core:core-ktx:1.13.1"
+
+    // Leia CNSDK (lightfield interlacer + face tracking)
+    implementation project(":cnsdk-weaver")
+
+    // TensorFlow Lite + Qualcomm QNN delegate (MiDaS on the Hexagon NPU)
+    implementation "org.tensorflow:tensorflow-lite:2.16.1"
+    implementation "org.tensorflow:tensorflow-lite-gpu:2.16.1"
+    implementation("com.qualcomm.qti:qnn-litert-delegate:2.34.0")
+    implementation("com.qualcomm.qti:qnn-runtime:2.34.0")
+
+}

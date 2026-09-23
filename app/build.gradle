@@ -1,0 +1,39 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.leofattal.mc3d"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.leofattal.mc3d"
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Personal-use convenience: sign release builds with the debug key
+            // so the APK can be sideloaded without extra setup.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation "androidx.webkit:webkit:1.10.0"
+    implementation project(":leia-cnsdk")
+}

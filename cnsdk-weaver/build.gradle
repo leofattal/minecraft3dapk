@@ -1,0 +1,4 @@
+// Local module exposing the Leia CNSDK 0.6.167 AAR (used by the 3D weaver).
+// See README.md for the origin and licensing situation of this artifact.
+configurations.maybeCreate("default")
+artifacts.add("default", file("sdk-final-aar-release.aar"))

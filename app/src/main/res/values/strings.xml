@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MC3D</string>
+    <string name="camera_rationale">The camera is used by the Leia 3D display for face tracking, which makes the 3D effect follow your head. You can deny it and still play in 2D.</string>
+</resources>

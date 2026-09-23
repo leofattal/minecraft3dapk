@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- Leia interlaced surface: composites the WebView content as a
+         side-by-side stereo pair onto the lightfield display. Sits behind
+         the WebView in 2D mode, above it (via elevation) in 3D mode. -->
+    <com.leofattal.mc3d.GameView
+        android:id="@+id/game_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <com.leofattal.mc3d.SurfaceAwareWebView
+        android:id="@+id/web_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+</FrameLayout>

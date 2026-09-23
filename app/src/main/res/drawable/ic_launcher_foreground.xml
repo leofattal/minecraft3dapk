@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Isometric voxel cube (grass block style) -->
+    <path
+        android:fillColor="#7CC576"
+        android:pathData="M54,28 L76,40 L54,52 L32,40 Z" />
+    <path
+        android:fillColor="#9E6B4A"
+        android:pathData="M32,40 L54,52 L54,80 L32,68 Z" />
+    <path
+        android:fillColor="#7A5138"
+        android:pathData="M76,40 L54,52 L54,80 L76,68 Z" />
+    <path
+        android:fillColor="#5DA65A"
+        android:pathData="M54,28 L76,40 L54,52 L32,40 Z"
+        android:strokeColor="#3E8E41"
+        android:strokeWidth="0" />
+    <path
+        android:fillColor="#4A7F44"
+        android:pathData="M44,33 L54,38 L64,33 L54,28 Z" />
+</vector>

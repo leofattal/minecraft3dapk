@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#79b4ff">
+<link rel="icon" href="data:,">
+<title>MC3D — Voxel Sandbox</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="crosshair"><span></span><span></span></div>
+<div id="water-overlay"></div>
+
+<div id="topbar">
+  <button id="btn-menu" title="Menu">&#9776;</button>
+  <button id="btn-exit-xr" class="hidden" title="Exit 3D">EXIT 3D</button>
+</div>
+
+<div id="hotbar"></div>
+
+<div id="touch-ui" class="hidden">
+  <div id="joystick">
+    <div id="joystick-base"></div>
+    <div id="joystick-knob"></div>
+  </div>
+  <div id="action-buttons">
+    <button id="btn-place" title="Place block">+ BLOCK</button>
+    <button id="btn-jump" title="Jump / hold to swim up">JUMP</button>
+    <button id="btn-fly" title="Toggle fly">FLY</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+<div id="debug" class="hidden"></div>
+
+<div id="splash">
+  <div class="panel">
+    <h1>MC<span>3D</span></h1>
+    <p class="tagline">A Minecraft-style voxel world in glasses-free 3D,<br>for the Leia Lume Pad &amp; other lightfield displays</p>
+    <div class="buttons">
+      <button id="btn-play" class="primary">&#9654; PLAY</button>
+      <button id="btn-play-xr">&#9851; PLAY IN 3D</button>
+      <button id="btn-new-world">NEW WORLD</button>
+    </div>
+    <p class="hint" id="xr-hint"></p>
+    <p class="credit">WebXR stereo pipeline in the spirit of dfattal.github.io &middot; Built with three.js</p>
+  </div>
+</div>
+
+<div id="menu" class="hidden">
+  <div class="panel">
+    <h2>PAUSED</h2>
+    <div class="buttons">
+      <button id="btn-resume" class="primary">RESUME</button>
+      <button id="btn-enter-xr">ENTER 3D</button>
+      <button id="btn-reset">RESET WORLD</button>
+    </div>
+    <p class="hint">
+      Move: WASD / left stick &middot; Look: drag / mouse<br>
+      Break: tap / left click &middot; Place: right click / + BLOCK<br>
+      Fly: F or double-jump &middot; Slots: 1&ndash;9 / wheel
+    </p>
+    <p class="credit" id="device-info"></p>
+  </div>
+</div>
+
+<script src="js/webxr-shim.js"></script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
