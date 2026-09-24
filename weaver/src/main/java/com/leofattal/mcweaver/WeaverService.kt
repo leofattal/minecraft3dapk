@@ -1,6 +1,5 @@
 package com.leofattal.mcweaver
 
-import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,38 +10,35 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import android.view.MotionEvent
 import android.view.WindowManager
 
 /**
- * Whole-tablet 3D, no interference:
+ * Whole-tablet 3D on a hidden trusted virtual display:
  *
- *  1. Capture the REAL screen with MediaProjection (one "Start now?" prompt
- *     per process) into an ImageReader we own.
- *  2. Every frame goes through: MiDaS depth (Hexagon NPU) -> DIBR stereo
- *     synthesis -> CNSDK lightfield weave on the real panel.
- *  3. The woven overlay is NOT_TOUCHABLE, so every touch, key, and nav button
- *     goes straight to the real apps beneath it — Minecraft, the on-screen
- *     keyboard, and the triangle/circle/square nav buttons all work exactly
- *     like normal, with zero forwarding.
+ *  1. creates a TRUSTED, system-decorated virtual display via Shizuku/shell —
+ *     the 3D desktop, with its own nav bar, that everything runs on;
+ *  2. launches the Android home screen there, so any app opened from the 3D
+ *     home runs in 3D (games, browser, videos);
+ *  3. captures the display into an ImageReader, runs MiDaS depth on the
+ *     Hexagon NPU, synthesizes the stereo pair (DIBR) and weaves it onto the
+ *     lightfield panel via the CNSDK interlacer with face tracking;
+ *  4. forwards every touch — all pointers, so two-thumb play, buttons, and
+ *     the keyboard (IME policy LOCAL renders it on the virtual display) work
+ *     natively in 3D.
  *
- * The overlay is FLAG_SECURE so the screen capture excludes the woven output
- * itself (no feedback loop). No overlay buttons at all: stop by closing the
- * pad (screen off) or from the notification.
- *
- * Output pipeline (CNSDK surface + EGL + DepthEngine) is created once and kept
- * alive across stop/start so restarts never black out. Only the capture side
- * (projection virtual display + ImageReader) is recreated per session.
+ * No on-screen buttons: stop by closing the pad (screen off) or from the
+ * notification. BACK from the hardware key is forwarded in. The output
+ * pipeline (CNSDK surface + EGL + DepthEngine) is created once and kept
+ * alive across stop/start so restarts never black out.
  */
 class WeaverService : Service() {
     companion object {
@@ -50,23 +46,46 @@ class WeaverService : Service() {
         private const val CHANNEL = "mcweaver"
         private const val NOTIF_ID = 43
         private const val ACTION_STOP = "com.leofattal.mcweaver.STOP"
+        private const val EXTRA_KEYCODE = "com.leofattal.mcweaver.KEYCODE"
+        private const val EXTRA_PKG = "com.leofattal.mcweaver.PKG"
         private const val MAX_CAPTURE_SIDE = 1280
 
+        /** Minecraft Bedrock has shipped under two package ids. */
+        val MINECRAFT_CANDIDATES = listOf(
+            "com.mojang.minecraftpe", "com.mojang.minecraft")
+
+        fun minecraftPackage(pm: android.content.pm.PackageManager): String? =
+            MINECRAFT_CANDIDATES.firstOrNull { pm.getLaunchIntentForPackage(it) != null }
+
+        /** The live service instance (non-null while the service exists at all). */
         @Volatile var active: WeaverService? = null
             private set
 
-        /** MediaProjection grant from the one-time consent prompt; reusable for
-         *  this process's lifetime so we don't re-prompt on every start. */
-        @Volatile var projectionGrant: Pair<Int, Intent>? = null
+        /**
+         * True only while a 3D session is actually weaving. This is distinct
+         * from [active]: STOP, screen-off, or a failed start leave the service
+         * alive but the session stopped, and the UI must then offer START
+         * again — keying the button off [active] made the app show STOP for a
+         * dead session and refuse to ever restart.
+         */
+        @Volatile var running = false
+            private set
 
-        fun startProjection(ctx: Context, resultCode: Int, data: Intent) {
-            projectionGrant = resultCode to data
-            ctx.startForegroundService(Intent(ctx, WeaverService::class.java))
+        fun start(ctx: Context, pkg: String? = null) {
+            ctx.startForegroundService(Intent(ctx, WeaverService::class.java)
+                .putExtra(EXTRA_PKG, pkg))
         }
 
         fun stop(ctx: Context) {
             ctx.startService(
                 Intent(ctx, WeaverService::class.java).setAction(ACTION_STOP))
+        }
+
+        /** Forward a hardware key (e.g. BACK) into the 3D desktop. */
+        fun forwardKey(ctx: Context, keyCode: Int) {
+            ctx.startService(Intent(ctx, WeaverService::class.java)
+                .setAction("com.leofattal.mcweaver.KEY")
+                .putExtra(EXTRA_KEYCODE, keyCode))
         }
     }
 
@@ -75,11 +94,11 @@ class WeaverService : Service() {
     private var renderer: StereoRenderer? = null
 
     // Capture pipeline — recreated on each START, torn down on STOP.
-    private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var readerThread: HandlerThread? = null
 
+    private var displayId = -1
     private var captureW = 0
     private var captureH = 0
     private var captureDpi = 160
@@ -91,14 +110,23 @@ class WeaverService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            hideSession()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                hideSession()
+                return START_NOT_STICKY
+            }
+            "com.leofattal.mcweaver.KEY" -> {
+                val code = intent.getIntExtra(EXTRA_KEYCODE, -1)
+                if (code > 0 && displayId >= 0) {
+                    Thread { ShellPriv.injectKey(code, displayId) }.start()
+                }
+                return START_STICKY
+            }
         }
 
-        val grant = projectionGrant
-        if (grant == null) {
-            Log.e(TAG, "no MediaProjection grant (consent not given?)")
+        if (!ShellPriv.isShizukuReady()) {
+            Log.e(TAG, "Shizuku not running/authorized")
+            updateStatus("Shizuku not ready — start Shizuku, then press START 3D")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -113,18 +141,47 @@ class WeaverService : Service() {
             return START_NOT_STICKY
         }
 
-        if (!startCapture(grant.first, grant.second)) {
-            updateStatus("Could not start screen capture")
+        if (!startCapture()) {
+            updateStatus("Virtual display creation failed")
             shutdown()
             return START_NOT_STICKY
         }
 
+        // Launch the chosen app onto the virtual display by explicit component.
+        // (A HOME-category start silently no-ops: it just brings the existing
+        // home task forward on display 0, leaving the virtual display black.)
+        val targetPkg = intent?.getStringExtra(EXTRA_PKG)
+            ?: minecraftPackage(packageManager)
+        Thread {
+            val ok = targetPkg != null && ShellPriv.launchOnDisplay(targetPkg, displayId)
+            Log.i(TAG, "launch $targetPkg on display $displayId -> $ok")
+            val imeOk = ShellPriv.setImeLocal(displayId)
+            Log.i(TAG, "ime local on display $displayId -> $imeOk")
+            Log.i(TAG, "display info:\n${ShellPriv.displayInfo(displayId)}")
+            updateStatus(when {
+                ok -> "Running ${appLabel(targetPkg)} in 3D (display $displayId)"
+                targetPkg == null -> "No app selected — pick one, stop, and retry"
+                else -> "Launch of $targetPkg failed; stop and retry"
+            })
+        }.start()
+
         weaving = true
+        running = true
         main.post { overlay?.show() }
         registerScreenOff()
-
-        updateStatus("Whole tablet in 3D — everything on screen is woven")
+        updateStatus("Starting ${appLabel(intent?.getStringExtra(EXTRA_PKG))} in 3D (display $displayId)")
         return START_STICKY
+    }
+
+    /** Display name for a package, falling back to the package id. */
+    private fun appLabel(pkg: String?): String {
+        if (pkg == null) return "app"
+        return try {
+            packageManager.getApplicationLabel(
+                packageManager.getApplicationInfo(pkg, 0)).toString()
+        } catch (_: Throwable) {
+            pkg
+        }
     }
 
     /** Build the persistent output pipeline once (CNSDK overlay + renderer). */
@@ -132,7 +189,8 @@ class WeaverService : Service() {
         if (overlay != null) return true
         val ov = Overlay3D(
             this, captureW * StereoRenderer.VIEWS, captureH,
-            onSurfaceReady = { st -> onStereoSurfaceReady(st) })
+            onSurfaceReady = { st -> onStereoSurfaceReady(st) },
+            onTouch = ::forwardTouch)
         if (!ov.init()) {
             Log.e(TAG, "overlay init failed (Leia services missing?)")
             return false
@@ -158,24 +216,9 @@ class WeaverService : Service() {
         Log.i(TAG, "renderer (re)created on fresh CNSDK surface")
     }
 
-    /** Build the capture side for a session: MediaProjection + virtual display
-     *  mirroring the real screen into our ImageReader. */
-    private fun startCapture(resultCode: Int, data: Intent): Boolean {
+    /** Build the capture side: trusted virtual display + ImageReader. */
+    private fun startCapture(): Boolean {
         teardownCapture()  // in case a previous session left one behind
-
-        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
-                as MediaProjectionManager
-        val mp = try {
-            mgr.getMediaProjection(resultCode, data)
-        } catch (t: Throwable) {
-            Log.e(TAG, "getMediaProjection failed: ${t.message}")
-            null
-        }
-        if (mp == null) {
-            Log.e(TAG, "getMediaProjection returned null")
-            return false
-        }
-        projection = mp
 
         val thread = HandlerThread("weaver-reader").apply { start() }
         readerThread = thread
@@ -195,29 +238,18 @@ class WeaverService : Service() {
         }, Handler(thread.looper))
         reader = imageReader
 
-        val vd = try {
-            mp.createVirtualDisplay(
-                "mcweaver-mirror", captureW, captureH, captureDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-                imageReader.surface, null, null)
-        } catch (t: Throwable) {
-            Log.e(TAG, "createVirtualDisplay failed: ${t.message}")
-            null
-        }
+        val vd = ShellPriv.createDisplay(
+            this, "mcweaver-display", captureW, captureH, captureDpi, imageReader.surface)
         if (vd == null) {
-            Log.e(TAG, "projection createVirtualDisplay failed")
+            Log.e(TAG, "virtual display creation failed")
             return false
         }
         display = vd
-
-        mp.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                Log.i(TAG, "projection stopped by the system")
-                main.post { hideSession() }
-            }
-        }, Handler(thread.looper))
-
-        Log.i(TAG, "capture ready: mirror of real screen at ${captureW}x${captureH}")
+        displayId = vd.display?.displayId ?: -1
+        if (displayId < 0) {
+            return false
+        }
+        Log.i(TAG, "capture ready: ${captureW}x${captureH} on display $displayId")
         return true
     }
 
@@ -227,18 +259,17 @@ class WeaverService : Service() {
         try { display?.release() } catch (_: Throwable) {}
         try { reader?.close() } catch (_: Throwable) {}
         try { readerThread?.quitSafely() } catch (_: Throwable) {}
-        try { projection?.stop() } catch (_: Throwable) {}
         display = null
         reader = null
         readerThread = null
-        projection = null
+        displayId = -1
     }
 
     /** Capture resolution: full physical panel scaled down to <=1280 on its
-     *  long side. Using the REAL panel size (not the app window's bounds, which
-     *  exclude system bars) keeps the capture aspect identical to the fullscreen
-     *  stereo output — the mismatch was what stretched the picture ("shape
-     *  broken") and sent taps to the wrong Y ("goes upwards"). */
+     *  long side. Using the REAL panel size keeps the capture aspect
+     *  identical to the fullscreen stereo output — the mismatch was what
+     *  stretched the picture ("shape broken") and sent taps to the wrong Y
+     *  ("goes upwards"). */
     private fun computeCaptureSize() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val fullW: Int
@@ -257,6 +288,69 @@ class WeaverService : Service() {
         captureH = (fullH * scale).toInt().let { it - it % 2 }
         captureDpi = maxOf(120, (resources.displayMetrics.densityDpi * scale).toInt())
         Log.i(TAG, "panel ${fullW}x${fullH} -> capture ${captureW}x${captureH} dpi=${captureDpi}")
+    }
+
+    // ------------------------------------------------------------------ input
+
+    private var inputThread: HandlerThread? = null
+    private var inputHandler: Handler? = null
+    private var safeAreaFrac = 0f
+
+    /**
+     * Forward a raw touch from the overlay into the virtual display's content,
+     * remapping EVERY pointer from panel coordinates into the capture rect so
+     * multi-touch (joystick + look + buttons at once) works natively.
+     */
+    private fun forwardTouch(ev: MotionEvent, offsetX: Int, offsetY: Int,
+                             panelW: Int, panelH: Int) {
+        if (displayId < 0 || panelW <= 0 || panelH <= 0 || captureW <= 0 || captureH <= 0) {
+            return
+        }
+        val action = ev.actionMasked
+        if (action != MotionEvent.ACTION_DOWN &&
+            action != MotionEvent.ACTION_POINTER_DOWN &&
+            action != MotionEvent.ACTION_MOVE &&
+            action != MotionEvent.ACTION_UP &&
+            action != MotionEvent.ACTION_POINTER_UP &&
+            action != MotionEvent.ACTION_CANCEL
+        ) {
+            return
+        }
+
+        // Remap every pointer from panel space into the capture rect
+        // (letterboxed by the safe-area margin, matching the DIBR shader).
+        val pad = safeAreaFrac
+        val span = (1f - 2f * pad).let { if (it <= 0f) 1f else it }
+        val count = ev.pointerCount
+        val props = arrayOfNulls<MotionEvent.PointerProperties>(count)
+        val coords = arrayOfNulls<MotionEvent.PointerCoords>(count)
+        for (i in 0 until count) {
+            val p = MotionEvent.PointerProperties()
+            ev.getPointerProperties(i, p)
+            val c = MotionEvent.PointerCoords()
+            ev.getPointerCoords(i, c)
+            val u = (((ev.getX(i) + offsetX) / panelW - pad) / span).coerceIn(0f, 1f)
+            val v = (((ev.getY(i) + offsetY) / panelH - pad) / span).coerceIn(0f, 1f)
+            c.x = u * captureW
+            c.y = v * captureH
+            props[i] = p
+            coords[i] = c
+        }
+
+        // Rebuild the event preserving the full action (incl. pointer index),
+        // pointer ids, and timing; inject onto the virtual display.
+        val mapped = MotionEvent.obtain(
+            ev.downTime, ev.eventTime, ev.action, count, props, coords,
+            ev.metaState, ev.buttonState, ev.xPrecision, ev.yPrecision,
+            ev.deviceId, ev.edgeFlags, ev.source, ev.flags)
+
+        if (inputHandler == null) {
+            val t = HandlerThread("weaver-input").apply { start() }
+            inputThread = t
+            inputHandler = Handler(t.looper)
+        }
+        val d = displayId
+        inputHandler?.post { ShellPriv.injectEvent(mapped, d) }
     }
 
     // ------------------------------------------------------------------ screen off
@@ -302,12 +396,13 @@ class WeaverService : Service() {
         rnd.swapEyes = prefs.getBoolean("swap", false)
         rnd.flipY = prefs.getBoolean("flip", false)
         rnd.safeArea = safe
+        safeAreaFrac = safe
     }
 
     // ------------------------------------------------------------------ lifecycle
 
     private fun startInForeground() {
-        startNotification("Starting 3D…")
+        startNotification("Starting… display $displayId")
     }
 
     private fun updateStatus(text: String) {
@@ -325,31 +420,30 @@ class WeaverService : Service() {
             this, 1, Intent(this, WeaverService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val notif: Notification = Notification.Builder(this, CHANNEL)
-            .setContentTitle("Minecraft 3D weaver")
+            .setContentTitle("MC 3D weaver")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPi)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notif,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
+        startForeground(NOTIF_ID, notif)
     }
 
-    /** STOP weaving: hide the overlay, tear down ONLY the capture side
-     *  (projection virtual display + ImageReader). The output pipeline
+    /** STOP weaving: move the 3D desktop's tasks back to the real screen,
+     *  hide the overlay, tear down ONLY the capture side. The output pipeline
      *  (renderer + EGL + DepthEngine + CNSDK) stays alive so the next START is
      *  instant and never blacks out. */
     private fun hideSession() {
         if (!weaving && active == null) return
-        Log.i(TAG, "hideSession: hiding overlay, tearing down capture")
+        Log.i(TAG, "hideSession: moving tasks to display 0, hiding overlay")
         weaving = false
+        running = false
         unregisterScreenOff()
         main.post { overlay?.hide() }
         Thread {
+            try {
+                ShellPriv.moveAllTasks(displayId, 0)
+            } catch (_: Throwable) {}
             teardownCapture()
             updateStatus("3D stopped — press START 3D to resume")
         }.start()
@@ -358,6 +452,7 @@ class WeaverService : Service() {
     /** Full teardown: everything, used when the process is going away. */
     private fun shutdown() {
         weaving = false
+        running = false
         unregisterScreenOff()
         try { overlay?.hide() } catch (_: Throwable) {}
         try { renderer?.release() } catch (_: Throwable) {}
@@ -365,7 +460,13 @@ class WeaverService : Service() {
         renderer = null
         overlay = null
         Thread {
+            try {
+                ShellPriv.moveAllTasks(displayId, 0)
+            } catch (_: Throwable) {}
             teardownCapture()
+            try { inputThread?.quitSafely() } catch (_: Throwable) {}
+            inputThread = null
+            inputHandler = null
             active = null
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()

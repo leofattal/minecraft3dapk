@@ -5,72 +5,85 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.projection.MediaProjectionManager
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.method.ScrollingMovementMethod
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.TextView
 
 /**
  * Setup + control UI. The whole-tablet 3D weaving runs in [WeaverService];
- * this activity only collects the two permissions it needs (screen capture
- * consent + draw-over-apps), stores tuning preferences, and starts/stops it.
+ * this activity only collects the permissions it needs (Shizuku + draw-over
+ * apps + camera for face tracking), stores tuning preferences, picks the app
+ * to run on the hidden 3D display, starts/stops the session, and forwards the
+ * hardware BACK key into the 3D display while the session is running.
  */
 class MainActivity : Activity() {
     companion object {
-        private const val REQ_PROJECTION = 71
         private const val REQ_CAMERA = 7
     }
 
-    private lateinit var prefs: android.content.SharedPreferences
+    private lateinit var prefs: SharedPreferences
     private lateinit var statusText: TextView
     private lateinit var startButton: Button
 
-    private val projectionManager: MediaProjectionManager
-        get() = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+    /** (label, package) pairs for the app picker; Minecraft pinned first. */
+    private var appList: List<Pair<String, String>> = emptyList()
+
+    private val shizukuListener = rikka.shizuku.Shizuku.OnRequestPermissionResultListener {
+        _, grantResult -> refreshStatus()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("weaver", Context.MODE_PRIVATE)
 
-        if (Build.VERSION.SDK_INT >= 23 &&
+        if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.CAMERA) !=
             PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
         }
 
         setContentView(buildUi())
+        rikka.shizuku.Shizuku.addRequestPermissionResultListener(shizukuListener)
         refreshStatus()
+    }
+
+    override fun onDestroy() {
+        rikka.shizuku.Shizuku.removeRequestPermissionResultListener(shizukuListener)
+        super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
         // Clear any zombie overlay left behind by an interrupted 3D session.
-        if (WeaverService.active == null && Overlay3D.current != null) {
-            try { Overlay3D.current?.release() } catch (_: Throwable) {}
+        // Only detach its windows — never release the process-wide Leia SDK.
+        if (!WeaverService.running && Overlay3D.current != null) {
+            try { Overlay3D.current?.hide() } catch (_: Throwable) {}
         }
         refreshStatus()
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_PROJECTION) {
-            if (resultCode == RESULT_OK && data != null) {
-                WeaverService.startProjection(this, resultCode, data)
-                refreshStatus()
-            } else {
-                toast("Screen capture permission is needed to weave the screen into 3D")
-            }
+    /** While 3D runs, the hardware BACK key goes to the 3D desktop. */
+    override fun onBackPressed() {
+        if (WeaverService.running) {
+            WeaverService.forwardKey(this, android.view.KeyEvent.KEYCODE_BACK)
+            return
         }
+        super.onBackPressed()
     }
 
     // ------------------------------------------------------------------ UI
@@ -88,7 +101,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         })
         root.addView(TextView(this).apply {
-            text = "Everything on your tablet, in glasses-free 3D"
+            text = "The whole tablet in glasses-free 3D"
             textSize = 13f
             gravity = Gravity.CENTER
             setPadding(0, pad / 2, 0, pad)
@@ -100,14 +113,48 @@ class MainActivity : Activity() {
         }
         root.addView(statusText)
 
-        root.addView(Button(this).apply {
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val shizukuBtn = Button(this).apply {
+            text = "Fix Shizuku"
+            setOnClickListener { fixShizuku() }
+        }
+        val overlayBtn = Button(this).apply {
             text = "Overlay permission"
             setOnClickListener {
                 startActivity(Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:$packageName")))
             }
+        }
+        buttons.addView(shizukuBtn, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        buttons.addView(overlayBtn, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(buttons)
+
+        root.addView(TextView(this).apply {
+            text = "App to run in 3D"
         })
+        appList = installedLaunchableApps()
+        val appSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity,
+                android.R.layout.simple_spinner_item,
+                appList.map { it.first }).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            val saved = prefs.getString("targetPkg", null)
+            val idx = appList.indexOfFirst { it.second == saved }
+            setSelection(if (idx >= 0) idx else 0)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                    prefs.edit().putString("targetPkg", appList[pos].second).apply()
+                }
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
+        }
+        root.addView(appSpinner)
 
         root.addView(TextView(this).apply {
             text = "3D depth strength"
@@ -151,14 +198,16 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text = """
-                How it works: everything currently on your screen — home screen,
-                Minecraft, browser, videos — is captured, given real depth by an
-                on-device AI pass, and woven onto the lightfield display in 3D.
+                One-time setup: install the Shizuku app (Play Store) and start
+                it via "Wireless debugging". Then tap Fix Shizuku and Overlay
+                permission here, allow the camera permission (face tracking).
 
-                No overlay buttons get in your way: touches, the on-screen
-                keyboard, and the back / home / recents buttons all work exactly
-                like normal. Close the pad (turn the screen off) or tap the Stop
-                notification to leave 3D.
+                START 3D launches the selected app onto a hidden 3D display
+                and weaves it in glasses-free 3D. Two-thumb touch works natively,
+                and the hardware BACK key goes to the 3D display.
+
+                The app keeps running when you stop: close the pad (turn the
+                screen off) or tap the notification's Stop action to leave 3D.
             """.trimIndent()
             textSize = 12f
             setPadding(0, pad, 0, 0)
@@ -211,7 +260,7 @@ class MainActivity : Activity() {
         Settings.canDrawOverlays(this)
 
     private fun onStartClicked() {
-        if (WeaverService.active != null) {
+        if (WeaverService.running) {
             WeaverService.stop(this)
             refreshStatus()
             return
@@ -222,18 +271,42 @@ class MainActivity : Activity() {
                 Uri.parse("package:$packageName")))
             return
         }
-        val grant = WeaverService.projectionGrant
-        if (grant != null) {
-            WeaverService.startProjection(this, grant.first, grant.second)
-        } else {
-            // One-time "Start now?" consent for screen capture.
-            startActivityForResult(
-                projectionManager.createScreenCaptureIntent(), REQ_PROJECTION)
+        if (!ShellPriv.isShizukuReady()) {
+            fixShizuku()
+            return
         }
+        WeaverService.start(this, prefs.getString("targetPkg", null))
     }
 
-    private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
+    /** All launchable apps, Minecraft pinned first, alphabetical after. */
+    private fun installedLaunchableApps(): List<Pair<String, String>> {
+        val pm = packageManager
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return pm.queryIntentActivities(intent, 0)
+            .map { it.loadLabel(pm).toString() to it.activityInfo.packageName }
+            .filter { it.second != packageName }
+            .distinctBy { it.second }
+            .sortedWith(compareBy(
+                { if (WeaverService.MINECRAFT_CANDIDATES.contains(it.second)) 0 else 1 },
+                { it.first.lowercase() }))
+    }
+
+    private fun fixShizuku() {
+        when {
+            ShellPriv.isShizukuReady() -> return
+            rikka.shizuku.Shizuku.pingBinder() -> try {
+                rikka.shizuku.Shizuku.requestPermission(71)
+            } catch (_: Throwable) {
+            }
+            else -> {
+                // Shizuku app not running: open its Play Store page or launch it.
+                val launch = packageManager.getLaunchIntentForPackage(
+                    "moe.shizuku.privileged.api")
+                if (launch != null) startActivity(launch)
+                else startActivity(Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api")))
+            }
+        }
     }
 
     private fun refreshService() {
@@ -241,13 +314,13 @@ class MainActivity : Activity() {
     }
 
     private fun refreshStatus() {
-        val running = WeaverService.active != null
+        val running = WeaverService.running
+        val shizuku = ShellPriv.isShizukuReady()
         val overlay = hasOverlayPermission()
-        val granted = WeaverService.projectionGrant != null
         statusText.text = buildString {
             append(if (running) "STATE: RUNNING 3D" else "STATE: stopped")
+            append("\nShizuku: ").append(if (shizuku) "ready" else "NOT ready")
             append("\nOverlay permission: ").append(if (overlay) "granted" else "missing")
-            append("\nScreen capture: ").append(if (granted) "granted" else "not yet granted (prompts on first start)")
         }
         startButton.text = if (running) "  STOP 3D  " else "  START 3D  "
     }

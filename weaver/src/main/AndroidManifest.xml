@@ -10,17 +10,25 @@
 
     <!-- Weaver foreground service. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Required by the Leia CNSDK (its system services do the face tracking). -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- CNSDK queries the on-device Leia services. -->
+    <!-- CNSDK queries the on-device Leia services; Shizuku manager. -->
     <queries>
         <package android:name="com.leia.headtrackingservice" />
         <package android:name="com.leialoft.display.config" />
+        <package android:name="moe.shizuku.privileged.api" />
+        <!-- Minecraft Bedrock (both historical package ids). -->
+        <package android:name="com.mojang.minecraftpe" />
+        <package android:name="com.mojang.minecraft" />
+        <!-- This app IS a launcher: the picker must see every launchable app. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
 
     <application
@@ -49,7 +57,16 @@
 
         <service
             android:name=".WeaverService"
-            android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:exported="false" />
+
+        <!-- Shizuku binder provider (required by the Shizuku API). -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+            tools:ignore="ExportedContentProvider" />
     </application>
 </manifest>

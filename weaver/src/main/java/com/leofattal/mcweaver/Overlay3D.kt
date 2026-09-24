@@ -6,7 +6,11 @@ import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
+import android.widget.FrameLayout
 import com.leia.core.LogLevel
 import com.leia.sdk.LeiaSDK
 import com.leia.sdk.graphics.SurfaceTextureReadyCallback
@@ -14,52 +18,90 @@ import com.leia.sdk.views.InputViewsAsset
 import com.leia.sdk.views.InterlacedSurfaceView
 
 /**
- * The on-screen 3D output: a fullscreen, opaque, NOT_TOUCHABLE, FLAG_SECURE
- * [InterlacedSurfaceView] that shows the woven side-by-side stereo image of
- * whatever is on the real screen beneath it.
+ * Owns the on-screen 3D machinery:
+ *  1. a fullscreen, pixel-exact, NOT_TOUCHABLE [InterlacedSurfaceView] window
+ *     that weaves our synthesized SBS stereo onto the lightfield panel (with
+ *     the Leia system face tracking), and
+ *  2. a transparent touch-catcher window stacked above it that receives ALL
+ *     touches (full multi-pointer events) and hands the raw MotionEvents to
+ *     the service, which remaps every pointer into the virtual display and
+ *     injects them there — two-thumb play, buttons, and the keyboard work
+ *     exactly like native.
  *
- *  - NOT_TOUCHABLE: every touch falls through to the real apps/nav bar beneath,
- *    so Minecraft, typing, and the triangle/circle/square nav buttons all work
- *    natively with no forwarding and no interference.
- *  - FLAG_SECURE: the screen capture excludes this overlay itself, so the
- *    woven image never feeds back into the pipeline (no infinite recursion).
- *  - No overlay buttons at all (they interfered with gameplay); stop by
- *    closing the pad (screen off) or the notification action.
+ * No on-screen buttons: stop by closing the pad (screen off) or the
+ * notification; BACK is forwarded from the activity.
  */
 class Overlay3D(
     private val context: Context,
     private val sbsWidth: Int,
     private val sbsHeight: Int,
     private val onSurfaceReady: (SurfaceTexture) -> Unit,
+    /** (event, offsetX, offsetY, panelW, panelH): raw touch + catcher window
+     *  offset + panel dims; the service remaps all pointers. */
+    private val onTouch: (MotionEvent, Int, Int, Int, Int) -> Unit,
 ) {
     companion object {
         private const val TAG = "Overlay3D"
 
-        /** Latest instance, used to clear a zombie overlay after an interrupted
-         *  session. */
+        /** Latest instance, used to clear a zombie overlay after an
+         *  interrupted session. */
         @Volatile var current: Overlay3D? = null
             private set
+
+        /**
+         * The Leia SDK is a process-global singleton. It is created once and
+         * NEVER closed while the process lives: `LeiaSDK.close()` tears down
+         * the CNSDK logger mutex, and the face-tracking service connection
+         * that completes afterwards (`BaseServiceConnection.onServiceConnected`)
+         * then locks that destroyed mutex and aborts the whole process with
+         * "FORTIFY: pthread_mutex_lock called on a destroyed mutex".
+         *
+         * Creating the SDK twice in one process is likewise unsafe, so a
+         * single instance is shared by every Overlay3D for the app's lifetime.
+         */
+        @Volatile private var sdkSingleton: LeiaSDK? = null
+        private val sdkLock = Any()
+
+        /** The process-wide Leia SDK, created on first use, never closed. */
+        private fun ensureSdk(context: Context): LeiaSDK? {
+            sdkSingleton?.let { return it }
+            synchronized(sdkLock) {
+                sdkSingleton?.let { return it }
+                return try {
+                    val args = LeiaSDK.InitArgs()
+                    args.enableFaceTracking = true
+                    args.requiresFaceTrackingPermissionCheck = false
+                    args.faceTrackingServerLogLevel = LogLevel.Error
+                    args.platform.context = context.applicationContext
+                    args.platform.logLevel = LogLevel.Error
+                    LeiaSDK.createSDK(args).also { sdkSingleton = it }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "LeiaSDK init failed: ${t.message}", t)
+                    null
+                }
+            }
+        }
     }
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private var leiaSdk: LeiaSDK? = null
     private var stereoView: InterlacedSurfaceView? = null
     private var stereoAdded = false
+    private var catcherView: FrameLayout? = null
+    private var catcherAdded = false
     private val main = Handler(Looper.getMainLooper())
 
+    // Catcher window geometry within the panel (captures its own offset so the
+    // service can map touches into panel coordinates).
+    private var catcherX = 0
+    private var catcherY = 0
+    private var panelW = 0
+    private var panelH = 0
+
     fun init(): Boolean {
-        leiaSdk = try {
-            val args = LeiaSDK.InitArgs()
-            args.enableFaceTracking = true
-            args.requiresFaceTrackingPermissionCheck = false
-            args.faceTrackingServerLogLevel = LogLevel.Error
-            args.platform.context = context.applicationContext
-            args.platform.logLevel = LogLevel.Error
-            LeiaSDK.createSDK(args)
-        } catch (t: Throwable) {
-            Log.e(TAG, "LeiaSDK init failed: ${t.message}", t)
-            null
-        }
+        // Leia CNSDK: interlacer + face tracking handled by the system services.
+        // Shared process-wide and never closed (see ensureSdk).
+        leiaSdk = ensureSdk(context)
         if (leiaSdk == null) return false
 
         val view = try {
@@ -94,9 +136,10 @@ class Overlay3D(
                         or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                         or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                         or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        // excluded from screen capture -> the woven output never
-                        // loops back into the pipeline
-                        or WindowManager.LayoutParams.FLAG_SECURE
+                        // Keep the panel awake while 3D is up, otherwise a
+                        // brief inactivity turns the screen off, which fires
+                        // ACTION_SCREEN_OFF and stops the session mid-game.
+                        or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                         or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                 PixelFormat.OPAQUE)
             wm.addView(view, params)
@@ -110,6 +153,38 @@ class Overlay3D(
         } catch (t: Throwable) {
             Log.w(TAG, "enableBacklight(true): ${t.message}")
         }
+
+        if (!catcherAdded) {
+            catcherAdded = true
+            val catcher = FrameLayout(context)
+            catcher.setOnTouchListener { _: View, e: MotionEvent ->
+                onTouch(e, catcherX, catcherY, panelW, panelH)
+                true
+            }
+            catcherView = catcher
+
+            // Cover the whole panel: touches on the real nav bar would hit
+            // display 0; the virtual display's own nav bar (system
+            // decorations) is the nav the user sees in 3D.
+            val metrics = wm.currentWindowMetrics
+            val bounds = metrics.bounds
+            panelW = bounds.width()
+            panelH = bounds.height()
+            catcherX = 0
+            catcherY = 0
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT)
+            params.gravity = Gravity.TOP or Gravity.START
+            params.x = 0
+            params.y = 0
+            wm.addView(catcher, params)
+        }
     }
 
     fun hide() {
@@ -121,12 +196,14 @@ class Overlay3D(
             leiaSdk?.enableBacklight(false)
         } catch (_: Throwable) {
         }
+        if (catcherAdded) {
+            catcherAdded = false
+            try { wm.removeView(catcherView) } catch (_: Throwable) {}
+            catcherView = null
+        }
         if (stereoAdded) {
             stereoAdded = false
-            try {
-                wm.removeView(stereoView)
-            } catch (_: Throwable) {
-            }
+            try { wm.removeView(stereoView) } catch (_: Throwable) {}
         }
     }
 
@@ -137,10 +214,9 @@ class Overlay3D(
         } catch (_: Throwable) {
         }
         stereoView = null
-        try {
-            leiaSdk?.close()
-        } catch (_: Throwable) {
-        }
+        // Deliberately do NOT close the Leia SDK: it is a process-global
+        // singleton and closing it while the face-tracking service is still
+        // (re)connecting aborts the process. Detaching the views is enough.
         leiaSdk = null
         if (current === this) {
             current = null

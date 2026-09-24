@@ -4,92 +4,82 @@ Two apps live in this repo, both targeting the **Leia Lume Pad / Nubia Pad 3D** 
 
 1. **`app` — MC3D**: a self-contained Minecraft-*style* voxel game (three.js, WebXR) that renders
    true stereo on the lightfield via a WebView + WebXR shim + CNSDK interlacer pipeline.
-2. **`weaver` — MC 3D Weaver**: real **Minecraft Bedrock** (or any installed app) played in
-   glasses-free 3D on the Lume Pad 2 using a trusted virtual display + on-device AI depth
-   (MiDaS on the Hexagon NPU) + DIBR stereo synthesis + the CNSDK interlacer. **No gaming PC
-   needed — everything runs on the tablet.**
+2. **`weaver` — MC 3D Weaver**: the **whole tablet in glasses-free 3D**. Whatever is on the real
+   screen — Minecraft, the browser, videos, the home screen — is captured, given real depth by
+   an on-device AI pass (MiDaS on the Hexagon NPU), and woven onto the lightfield display.
+   **Everything keeps working natively: two-thumb touch, the on-screen keyboard, and the
+   back / home / recents buttons.**
 
 Pick the APK you want:
 
 - `app/build/outputs/apk/release/app-release.apk` — the voxel game (works on Lume Pad 1/2)
-- `weaver/build/outputs/apk/release/weaver-release.apk` — the weaver for real Minecraft (Lume Pad 2)
+- `weaver/build/outputs/apk/release/weaver-release.apk` — the whole-tablet 3D weaver (Lume Pad 2)
 
 ---
 
-## MC 3D Weaver — real Minecraft in 3D, on-device
+## MC 3D Weaver — the whole tablet in 3D
 
-### Why the weaver looks the way it does
+### How it works
 
-Actual Minecraft Bedrock cannot render stereo itself (closed renderer, no SBS, no mods), the
-Lume Pad 2 has no global SBS/AI-3D mode for apps, and an overlay + screen capture approach
-feeds back on itself. The weaver therefore moves the **game onto a hidden virtual display**
-and rebuilds the visible image:
+Minecraft Bedrock cannot render stereo itself and can't be modded on Android. A fullscreen
+`FLAG_SECURE` overlay on the real screen cannot work either: on Android 12 the secure overlay
+is captured as **black**, so the weaver saw a black screen. The weaver therefore runs apps on
+a **hidden virtual display it owns**, captures that display directly (no feedback loop, no
+MediaProjection), and forwards touches into it:
 
 ```
-Minecraft ──runs on──> trusted virtual display (created via Shizuku/shell)
-                              │ frames
-                              ▼
-                     ImageReader (our own surface, no MediaProjection,
-                              no consent dialog, no feedback loop)
-                              │ RGBA frame + MiDaS depth (Hexagon NPU, ~15-30 Hz)
-                              ▼
-                     DIBR shader: synthesize left/right views (SBS)
-                              │
-                              ▼
-        CNSDK InterlacedSurfaceView overlay ── lightfield weave + face tracking
-        (fullscreen, pixel-exact, not touchable)
-                              ▲
-        touches ── touch-catcher overlay ── injected onto the virtual display
+Shizuku (shell uid) ──► trusted* virtual display + real Android home screen ("3D desktop")
+        │                     ▲
+        │  ImageReader        │  injected MotionEvents (ALL pointers, multi-touch)
+        ▼                     │
+MiDaS depth (Hexagon NPU, ~15-30 Hz) ──► DIBR stereo pair (SBS)
+        │
+        ▼
+CNSDK InterlacedSurfaceView overlay (fullscreen, NOT_TOUCHABLE)
+        └─ weaves the stereo pair onto the lightfield with face tracking
+        + a transparent touch-catcher window that forwards every pointer
 ```
 
-- **Depth is AI-estimated** from the mono frame (the same "SS3D" idea Leia used), so 3D
-  quality is good-but-not-perfect: terrain, buildings and the world read deeply; thin
-  foreground objects (leaves, the hotbar) can warp. Voxel geometry is a friendly case.
-- **The game itself never runs in 3D internally** — Bedrock cannot. This is a real-time
-  2D→stereo conversion, done on-device.
-- **Latency**: the 3D image trails direct rendering by roughly 1-3 frames; depth updates are
-  throttled. Fine for building/exploring, noticeable in fast motion.
+- The 3D desktop is a virtual display with its own home screen. Open Minecraft (or anything
+  else) *from that desktop* and it renders in 3D.
+- Touches are captured by a transparent overlay and re-injected as **complete multi-pointer
+  events**, so the joystick, look-around drag, and jump/action buttons all work at once.
+- `*` The display is created **TRUSTED** when the shell uid is allowed to (some ROMs, e.g.
+  this Lume Pad build, do not grant `ADD_TRUSTED_DISPLAY`); it then falls back to a plain
+  untrusted display, which still accepts injected input.
+- Depth is AI-estimated from the flat frame (the same "SS3D" idea Leia used): terrain and
+  buildings read deeply; thin foreground objects can warp.
+- **To stop 3D, close the pad** (screen off stops the session) or tap **Stop** in the
+  notification. There are no on-screen buttons to interfere with gameplay.
 
-### One-time setup (on the tablet, no PC)
+### Setup (on the tablet)
 
-1. Install the **Shizuku** app (Play Store, or https://shizuku.rikka.app) and start it via
-   **"Wireless debugging"** — Shizuku's own setup guide walks you through it entirely
-   on-device.
-2. Install `weaver-release.apk` (`adb install -r weaver/build/outputs/apk/release/weaver-release.apk`
-   or copy it over and open with a file manager).
-3. Open **MC 3D Weaver**:
-   - tap **Fix Shizuku** → allow,
-   - tap **Overlay permission** → allow,
-   - allow the camera permission when asked (used by the display's face tracking).
-4. Make sure **Minecraft Bedrock** (`com.mojang.minecraft`) is installed and you're logged
-   in (the weaver force-stops and relaunches it — any app in the picker works, Minecraft is
-   just the default).
+1. Install `weaver-release.apk` (adb install or copy it over and open with a file manager).
+2. Install the **Shizuku** app and start it ("Start via Wireless debugging").
+3. Open **MC 3D Weaver** → tap **Fix Shizuku** → allow. Tap **Overlay permission** → allow,
+   and allow the camera permission when asked (used by the display's face tracking).
+4. Tap **START 3D** → the home screen appears in 3D (the "3D desktop"). Open Minecraft from
+   it and play. No screen-capture consent prompt is needed.
+5. Shizuku stops when the tablet reboots — reopen Shizuku, tap Start, then START 3D again.
 
-### Playing
+### Tuning
 
-- Tap **START 3D**. Minecraft launches and appears in glasses-free 3D; your touches are
-  forwarded automatically. Mind the face-tracking sweet spot.
-- **FLIP / SWAP / STOP 3D** buttons (top-right) work live while playing: fix an upside-down
-  image, inverted depth, or exit. Recents/Home/notification shade stay usable.
-- The game defaults to whichever Minecraft build is installed — the Lume Pad 2's Bedrock
-  package is `com.mojang.minecraftpe` (the Play listing's `com.mojang.minecraft` is also
-  accepted). Any other installed app can be picked instead.
-- Tuning in the app: **3D depth strength**, **convergence** (where the screen plane sits),
-  **swap eyes** if depth looks inverted, **flip image** if the picture renders upside down.
-- `adb logcat -s WeaverService StereoRenderer DepthEngine ShellPriv Overlay3D` shows the
-  pipeline state (fps, NPU vs CPU depth, display id). A healthy session logs
-  `depth interpreter running on Hexagon HTP` and ~50-60 render fps.
+In the app (adjusts live while 3D runs): **3D depth strength**, **convergence** (where the
+screen plane sits), **screen margin**, **swap eyes** if depth looks inverted, **flip image**
+if the picture renders upside down.
+
+`adb logcat -s WeaverService StereoRenderer DepthEngine Overlay3D` shows pipeline state
+(fps, NPU vs CPU depth). A healthy session logs `depth interpreter running on Hexagon HTP`
+and steady render fps.
 
 ### Requirements & limits
 
-- Lume Pad 2 (Snapdragon 888, Android 12, Leia services present). The CNSDK 0.6.167 AAR
-  requires Android 11+. On non-Leia devices the overlay init fails gracefully.
-- Shizuku must be running (it stops on reboot — restart it, then START 3D again).
-- Performance: depth on the Hexagon NPU is real-time; XNNPACK-CPU fallback is slow — if
-  you see "QNN HTP unavailable" in logcat, free some memory and retry.
-- DRM/secure-flag apps capture black — ordinary games are fine.
-- Multi-touch is not forwarded (single-pointer taps/swipes only). A Bluetooth controller
-  connected to the tablet works natively in Minecraft while the weaver displays the game.
+- Lume Pad 2 (Snapdragon 888, Android 12, Leia services present). On non-Leia devices the
+  overlay init fails gracefully.
+- DRM/secure-flag content (e.g. Netflix) captures black — ordinary apps and games are fine.
+- Depth on the Hexagon NPU is real-time; the XNNPACK CPU fallback is slow — if logcat shows
+  `QNN HTP unavailable`, free some memory and retry.
+- The 3D image trails the real screen by roughly 1-3 frames (capture + weave latency).
 
 ### Licensing / attribution notes for the weaver
 
@@ -103,12 +93,12 @@ Minecraft ──runs on──> trusted virtual display (created via Shizuku/shel
 - **MiDaS w8a8 model** (`weaver/src/main/assets/midas_w8a8.tflite`, ~17.7 MB) — the
   quantized MiDaS CNN exported for **Qualcomm AI Hub** (`midas-tflite-w8a8`); same
   provenance as above. Code: isl-org/MiDaS (MIT). Use subject to the AI Hub terms.
-- **Architecture credit**: the virtual-display weaver approach and the QNN/HTP depth path
-  were demonstrated by the (unlicensed, hence not copied) `LumePad3DEverywhere` project and
-  by [DepthFlix](https://github.com/nautymac/DepthFlix)'s documented Moonlight weaving.
+- **Architecture credit**: the DIBR weaving pipeline was demonstrated by the (unlicensed,
+  hence not copied) `LumePad3DEverywhere` project and by
+  [DepthFlix](https://github.com/nautymac/DepthFlix)'s documented Moonlight weaving.
   All source code in `weaver/` here is an original clean-room implementation.
-- **Shizuku** (Apache-2.0), **HiddenApiBypass** (Apache-2.0), **TensorFlow Lite**
-  (Apache-2.0), **Qualcomm QNN LiteRT delegate + runtime** — via Maven Central.
+- **TensorFlow Lite** (Apache-2.0) and the **Qualcomm QNN LiteRT delegate + runtime** —
+  via Maven Central.
 - Minecraft is a trademark of Mojang/Microsoft; this project is not affiliated and does not
   modify or redistribute the game — it displays the game you installed, on your own device.
 
@@ -226,14 +216,13 @@ app/                       MC3D — the voxel game (WebView + WebXR shim)
     js/webxr-shim.js         WebXR implementation for the Leia stereo window
     js/vendor/three.module.min.js  three.js r160
 leia-cnsdk/                 local AAR module wrapping the Leia CNSDK 0.7.28 artifact
-weaver/                     MC 3D Weaver — real Minecraft in 3D (Lume Pad 2)
+weaver/                     MC 3D Weaver — whole-tablet 3D (Lume Pad 2)
   src/main/java/com/leofattal/mcweaver/
-    MainActivity.kt          prerequisites UI, tuning sliders, start/stop
-    WeaverService.kt         orchestration: capture, launch, overlay, input
-    ShellPriv.kt             Shizuku/shell: trusted virtual display, launch, injection
+    MainActivity.kt          permissions UI, tuning sliders, start/stop
+    WeaverService.kt         MediaProjection capture + weave orchestration
     StereoRenderer.kt        EGL + DIBR stereo synthesis into the CNSDK surface
     DepthEngine.kt           MiDaS w8a8 on the Hexagon NPU (QNN delegate)
-    Overlay3D.kt             CNSDK interlaced overlay + touch-catcher windows
+    Overlay3D.kt            CNSDK interlaced pass-through overlay
   src/main/assets/midas_w8a8.tflite   quantized MiDaS depth model
 cnsdk-weaver/               local AAR module wrapping the Leia CNSDK 0.6.167 artifact
 ```
