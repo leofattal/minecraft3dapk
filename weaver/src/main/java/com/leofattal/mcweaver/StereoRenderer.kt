@@ -56,8 +56,31 @@ class StereoRenderer(
 
     private val frameLock = Any()
     private var pendingFrame: ByteBuffer? = null
+    private var pendingIndex = -1
     private var pendingW = 0
     private var pendingH = 0
+
+    // Capture-frame pool: fixed ~4 MB direct buffers handed from the
+    // ImageReader thread to the render thread. Allocating a fresh buffer
+    // per frame (plus a 256 KB depth copy) churned the heap every frame
+    // and stuttered or killed long sessions. frameBusy[i] is set while a
+    // buffer is being filled, pending, or uploaded; when the pool is
+    // exhausted the incoming frame is dropped — the latest-frame-only
+    // policy already prefers dropping over queueing.
+    private val framePool = Array(3) {
+        ByteBuffer.allocateDirect(captureW * captureH * 4).order(ByteOrder.nativeOrder())
+    }
+    private val frameBusy = BooleanArray(3)
+    private val rowScratch = ByteArray(captureW * 4)
+
+    // Two rotating depth readback buffers: one holds the pixels being
+    // inferred on the depth thread, the other the pixels being read back
+    // (depthBusy guarantees at most one inference is in flight).
+    private val depthBufs = Array(2) {
+        ByteBuffer.allocateDirect(DepthEngine.SIZE * DepthEngine.SIZE * 4)
+            .order(ByteOrder.nativeOrder())
+    }
+    private var depthFlip = 0
 
     private lateinit var renderThread: HandlerThread
     private lateinit var renderHandler: Handler
@@ -81,9 +104,6 @@ class StereoRenderer(
     private var depth: DepthEngine? = null
     @Volatile private var depthBusy = false
     private var frameCounter = 0
-    private val depthReadBuf: ByteBuffer =
-        ByteBuffer.allocateDirect(DepthEngine.SIZE * DepthEngine.SIZE * 4)
-            .order(ByteOrder.nativeOrder())
     private var frameCount = 0L
     private var fpsStart = 0L
 
@@ -116,25 +136,41 @@ class StereoRenderer(
         renderHandler.sendEmptyMessage(MSG_INIT)
     }
 
-    /** Called from the ImageReader thread; keeps the latest frame only. */
+    /** Called from the ImageReader thread; keeps the latest frame only.
+     * Copies into a pooled buffer (no per-frame allocation); drops the
+     * frame when every pooled buffer is still handed off. */
     fun pushFrame(src: ByteBuffer, width: Int, height: Int, rowStride: Int) {
-        val packed = ByteBuffer.allocateDirect(width * height * 4)
-            .order(ByteOrder.nativeOrder())
+        if (width * height * 4 > framePool[0].capacity()) {
+            Log.w(TAG, "frame ${width}x${height} exceeds pool size; dropped")
+            return
+        }
+        val idx = synchronized(frameLock) {
+            var free = -1
+            for (i in frameBusy.indices) if (!frameBusy[i]) { free = i; break }
+            if (free < 0) return           // render thread behind; drop frame
+            frameBusy[free] = true
+            free
+        }
+        val packed = framePool[idx]
+        packed.clear()
         val rowBytes = width * 4
         if (rowStride == rowBytes) {
             src.rewind()
             packed.put(src)
         } else {
-            val row = ByteArray(rowBytes)
+            val row = if (rowBytes <= rowScratch.size) rowScratch else ByteArray(rowBytes)
             for (y in 0 until height) {
                 src.position(y * rowStride)
                 src.get(row, 0, rowBytes)
-                packed.put(row)
+                packed.put(row, 0, rowBytes)
             }
         }
         packed.rewind()
         synchronized(frameLock) {
+            // A previous frame never got rendered; hand its buffer back.
+            if (pendingIndex >= 0) frameBusy[pendingIndex] = false
             pendingFrame = packed
+            pendingIndex = idx
             pendingW = width
             pendingH = height
         }
@@ -248,12 +284,15 @@ class StereoRenderer(
         val buf: ByteBuffer
         val w: Int
         val h: Int
+        val idx: Int
         synchronized(frameLock) {
             val p = pendingFrame ?: return
             buf = p
             w = pendingW
             h = pendingH
+            idx = pendingIndex
             pendingFrame = null
+            pendingIndex = -1
         }
 
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, frameTex)
@@ -266,6 +305,9 @@ class StereoRenderer(
             GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, w, h,
                 GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
         }
+        // Client-pointer GL uploads consume the data before returning, so
+        // the buffer can go straight back to the pool.
+        synchronized(frameLock) { frameBusy[idx] = false }
 
         // depth input downscale + throttled readback
         runBlit(frameTex, downscaleFbo, DepthEngine.SIZE, DepthEngine.SIZE, blitProgram)
@@ -315,18 +357,15 @@ class StereoRenderer(
     private fun dispatchDepth() {
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, downscaleFbo)
         GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
-        depthReadBuf.rewind()
+        val buf = depthBufs[depthFlip]
+        depthFlip = 1 - depthFlip
+        buf.rewind()
         GLES30.glReadPixels(0, 0, DepthEngine.SIZE, DepthEngine.SIZE,
-            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, depthReadBuf)
+            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-        val copy = ByteBuffer.allocateDirect(DepthEngine.SIZE * DepthEngine.SIZE * 4)
-            .order(ByteOrder.nativeOrder())
-        depthReadBuf.rewind()
-        copy.put(depthReadBuf)
-        copy.rewind()
         depthBusy = true
         depthHandler.removeMessages(0)
-        depthHandler.sendMessage(depthHandler.obtainMessage(0, copy))
+        depthHandler.sendMessage(depthHandler.obtainMessage(0, buf))
     }
 
     private val depthBytes = ByteArray(DepthEngine.SIZE * DepthEngine.SIZE)
@@ -459,9 +498,19 @@ class StereoRenderer(
             v = (v - uSafe) / (1.0 - 2.0 * uSafe);
             float eye = tile == 0.0 ? 1.0 : -1.0;    // left eye shifts right
             if (uSwap > 0.5) eye = -eye;
-            float d = texture(uDepth, vec2(u, v)).r;      // 1 = near, 0 = far
-            float disp = uBaseline * (d - uConvergence);
-            float sx = clamp(u + eye * disp, 0.0, 1.0);
+            // Depth at the OUTPUT pixel only describes where flat-scene
+            // color came from; at object edges the fetched color actually
+            // lives at a different depth, and using the output-pixel depth
+            // smears foreground parallax onto the background. Re-sample the
+            // depth at the shifted position a few times so the parallax
+            // converges to the depth of the color that is actually fetched.
+            float d = texture(uDepth, vec2(u, v)).r;
+            float sx = u;
+            for (int i = 0; i < 3; i++) {
+                sx = clamp(u + eye * uBaseline * (d - uConvergence), 0.0, 1.0);
+                d = texture(uDepth, vec2(sx, v)).r;
+            }
+            sx = clamp(u + eye * uBaseline * (d - uConvergence), 0.0, 1.0);
             vec3 color = texture(uFrame, vec2(sx, v)).rgb;
             frag = vec4(color, 1.0);
         }

@@ -166,10 +166,15 @@ class Overlay3D(
             // Cover the whole panel: touches on the real nav bar would hit
             // display 0; the virtual display's own nav bar (system
             // decorations) is the nav the user sees in 3D.
-            val metrics = wm.currentWindowMetrics
-            val bounds = metrics.bounds
-            panelW = bounds.width()
-            panelH = bounds.height()
+            // Measure the REAL panel size (status bar area included), not
+            // currentWindowMetrics.bounds, which excludes system bars: the
+            // overlay covers the full panel, so the touch normalization must
+            // use the full panel too or taps drift off toward the bottom.
+            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+            val p = android.graphics.Point()
+            dm.getDisplay(android.view.Display.DEFAULT_DISPLAY)?.getRealSize(p)
+            panelW = p.x
+            panelH = p.y
             catcherX = 0
             catcherY = 0
             val params = WindowManager.LayoutParams(

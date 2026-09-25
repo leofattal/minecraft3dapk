@@ -230,21 +230,43 @@ object ShellPriv {
         false
     }
 
+    /** True when the last [launchOnDisplay] reused the app's existing
+     *  task instead of restarting it (state preserved — e.g. browser
+     *  tabs survive). The service surfaces a hint so the user can retry
+     *  with a stop/start if a particular app misbehaves. */
+    @Volatile var lastLaunchKeptState = false
+        private set
+
     /**
-     * Fresh-launch a single app onto [displayId]. Tasks merely migrated to an
-     * OWN_CONTENT_ONLY display render black, so the launch always
-     * force-stops and starts clean.
+     * Launch a single app onto [displayId] WITHOUT destroying its state
+     * when it is already running: a plain `am start --display` moves the
+     * existing task, so browsers keep their tabs and games keep their
+     * session. Only if that start outright fails do we force-stop and
+     * start clean.
+     *
+     * (The historical always-force-stop existed because tasks MOVED via
+     * `am stack move-task` onto an OWN_CONTENT_ONLY display rendered
+     * black; a start carrying launch-display options is a real launch,
+     * not a mere move, so the restart is no longer needed in general.)
      */
     fun launchOnDisplay(pkg: String, displayId: Int): Boolean {
         return try {
             val component = launcherComponent(pkg) ?: return false
-            shRun("am", "force-stop", pkg)
-            val rc = shRun("am", "start", "--display", displayId.toString(),
+            fun start(): Int = shRun("am", "start", "--display", displayId.toString(),
                 "-a", "android.intent.action.MAIN",
                 "-c", "android.intent.category.LAUNCHER",
                 "-n", component,
                 "-f", (0x10000000 or 0x00200000).toString())
-            Log.i(TAG, "launched $component on display $displayId rc=$rc")
+            var rc = start()
+            var restarted = false
+            if (rc != 0) {
+                shRun("am", "force-stop", pkg)
+                restarted = true
+                rc = start()
+            }
+            lastLaunchKeptState = rc == 0 && !restarted
+            Log.i(TAG, "launched $component on display $displayId rc=$rc " +
+                "restarted=$restarted keptState=${lastLaunchKeptState}")
             rc == 0
         } catch (t: Throwable) {
             Log.e(TAG, "launchOnDisplay failed: ${t.message}", t)

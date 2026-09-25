@@ -18,8 +18,10 @@ import java.nio.channels.FileChannel
  *
  * Input: 256x256 RGBA bytes; quantized per the model metadata
  * (q = round((p/255)/scale) + zp).
- * Output: 256x256 float depth in [0,1] (1 = nearest), per-frame normalized,
- * temporally smoothed and lightly blurred for stable stereo warping.
+ * Output: 256x256 float depth in [0,1] (1 = nearest), normalized with
+ * temporally smoothed 2nd/98th percentiles (so the scale does not
+ * "breathe" when something close enters the frame), dilated at object
+ * edges, and lightly blurred for stable stereo warping.
  *
  * Must be used from a single thread.
  */
@@ -36,6 +38,8 @@ class DepthEngine(context: Context) {
 
         private const val EMA = 0.35f          // new-frame weight for smoothing
         private const val BLUR_RADIUS = 4       // spatial blur, kills depth noise
+        private const val DILATE_RADIUS = 1     // 3x3 max filter before the blur
+        private const val SCALE_EMA = 0.10f     // smoothing of the percentile pair
     }
 
     private val interpreter: Interpreter
@@ -48,7 +52,11 @@ class DepthEngine(context: Context) {
     private val raw = FloatArray(SIZE * SIZE)
     private val smoothed = FloatArray(SIZE * SIZE)
     private val blurTmp = FloatArray(SIZE * SIZE)
+    private val dilateOut = FloatArray(SIZE * SIZE)
     private val blurOut = FloatArray(SIZE * SIZE)
+    private val hist = IntArray(256)
+    private var smLo = Float.NaN
+    private var smHi = Float.NaN
     private val depthOut: FloatBuffer =
         ByteBuffer.allocateDirect(SIZE * SIZE * 4).order(ByteOrder.nativeOrder())
             .asFloatBuffer()
@@ -131,57 +139,43 @@ class DepthEngine(context: Context) {
 
     private fun normalize(): FloatBuffer {
         val total = SIZE * SIZE
-        var min = Float.MAX_VALUE
-        var max = -Float.MAX_VALUE
+        java.util.Arrays.fill(hist, 0)
         for (i in 0 until total) {
-            val v = (outputBuf.get(i).toInt() and 0xFF) * OUT_SCALE
-            raw[i] = v
-            if (v < min) min = v
-            if (v > max) max = v
+            val b = outputBuf.get(i).toInt() and 0xFF
+            raw[i] = b * OUT_SCALE
+            hist[b]++
         }
-        val range = if (max - min < 1e-6f) 1f else max - min
+        // Robust, temporally stable scale: per-frame min/max made the whole
+        // scene "breathe" whenever something close entered the frame. The
+        // 2nd/98th percentiles ignore such outliers, and EMA-smoothing the
+        // pair keeps the scale from jumping frame to frame.
+        val lo = DepthMath.percentileBin(hist, total, 0.02f) * OUT_SCALE
+        val hi = DepthMath.percentileBin(hist, total, 0.98f) * OUT_SCALE
+        if (smLo.isNaN()) {
+            smLo = lo
+            smHi = hi
+        } else {
+            smLo += SCALE_EMA * (lo - smLo)
+            smHi += SCALE_EMA * (hi - smHi)
+        }
+        DepthMath.rescale(raw, raw, smLo, smHi)
         depthOut.clear()
         if (!smoothedInit) {
-            for (i in 0 until total) {
-                smoothed[i] = ((raw[i] - min) / range).coerceIn(0f, 1f)
-            }
+            System.arraycopy(raw, 0, smoothed, 0, total)
             smoothedInit = true
         } else {
             for (i in 0 until total) {
-                val v = ((raw[i] - min) / range).coerceIn(0f, 1f)
-                smoothed[i] += EMA * (v - smoothed[i])
+                smoothed[i] += EMA * (raw[i] - smoothed[i])
             }
         }
-        boxBlur(smoothed, blurOut)
+        // Dilate before blurring: the blur averages foreground depth onto
+        // the background at object edges, smearing them; a small max filter
+        // keeps near silhouettes at (slightly beyond) their true extent.
+        DepthMath.dilate(smoothed, dilateOut, blurTmp, SIZE, DILATE_RADIUS)
+        DepthMath.boxBlur(dilateOut, blurOut, blurTmp, SIZE, BLUR_RADIUS)
         for (i in 0 until total) depthOut.put(blurOut[i])
         depthOut.rewind()
         return depthOut
-    }
-
-    /** Separable box blur; src and dst must be distinct arrays. */
-    private fun boxBlur(src: FloatArray, dst: FloatArray) {
-        val n = SIZE
-        val r = BLUR_RADIUS
-        val inv = 1f / (2 * r + 1)
-        for (y in 0 until n) {
-            val row = y * n
-            var acc = 0f
-            for (k in -r..r) acc += src[row + k.coerceIn(0, n - 1)]
-            for (x in 0 until n) {
-                blurTmp[row + x] = acc * inv
-                acc += src[row + (x + r + 1).coerceIn(0, n - 1)] -
-                    src[row + (x - r).coerceIn(0, n - 1)]
-            }
-        }
-        for (x in 0 until n) {
-            var acc = 0f
-            for (k in -r..r) acc += blurTmp[k.coerceIn(0, n - 1) * n + x]
-            for (y in 0 until n) {
-                dst[y * n + x] = acc * inv
-                acc += blurTmp[(y + r + 1).coerceIn(0, n - 1) * n + x] -
-                    blurTmp[(y - r).coerceIn(0, n - 1) * n + x]
-            }
-        }
     }
 
     fun close() {

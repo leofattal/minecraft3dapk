@@ -19,7 +19,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
-import android.view.WindowManager
 
 /**
  * Whole-tablet 3D on a hidden trusted virtual display:
@@ -158,7 +157,11 @@ class WeaverService : Service() {
             val imeOk = ShellPriv.setImeLocal(displayId)
             Log.i(TAG, "ime local on display $displayId -> $imeOk")
             Log.i(TAG, "display info:\n${ShellPriv.displayInfo(displayId)}")
+            val keptState = ShellPriv.lastLaunchKeptState
             updateStatus(when {
+                ok && keptState ->
+                    "Running ${appLabel(targetPkg)} in 3D (display $displayId) — " +
+                    "resumed without restart; if it stays black, stop and start 3D again"
                 ok -> "Running ${appLabel(targetPkg)} in 3D (display $displayId)"
                 targetPkg == null -> "No app selected — pick one, stop, and retry"
                 else -> "Launch of $targetPkg failed; stop and retry"
@@ -266,23 +269,19 @@ class WeaverService : Service() {
     }
 
     /** Capture resolution: full physical panel scaled down to <=1280 on its
-     *  long side. Using the REAL panel size keeps the capture aspect
-     *  identical to the fullscreen stereo output — the mismatch was what
-     *  stretched the picture ("shape broken") and sent taps to the wrong Y
-     *  ("goes upwards"). */
+     *  long side. The size MUST come from [Display.getRealSize] — the raw
+     *  panel including the status bar area — because the 3D overlay windows
+     *  are added with FLAG_LAYOUT_IN_SCREEN | FLAG_LAYOUT_NO_LIMITS and cover
+     *  every physical pixel. WindowMetrics bounds exclude the status bar;
+     *  sizing the virtual display from them made its aspect differ from the
+     *  panel (black groove on top) and broke the touch normalization (taps
+     *  drifted further off toward the bottom of the screen). */
     private fun computeCaptureSize() {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val fullW: Int
-        val fullH: Int
-        if (Build.VERSION.SDK_INT >= 30) {
-            val m = wm.maximumWindowMetrics.bounds
-            fullW = m.width(); fullH = m.height()
-        } else {
-            val p = android.graphics.Point()
-            @Suppress("DEPRECATION")
-            wm.defaultDisplay.getRealSize(p)
-            fullW = p.x; fullH = p.y
-        }
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+        val p = android.graphics.Point()
+        dm.getDisplay(android.view.Display.DEFAULT_DISPLAY)?.getRealSize(p)
+        val fullW = p.x
+        val fullH = p.y
         val scale = minOf(1f, MAX_CAPTURE_SIDE.toFloat() / maxOf(fullW, fullH))
         captureW = (fullW * scale).toInt().let { it - it % 2 }
         captureH = (fullH * scale).toInt().let { it - it % 2 }
@@ -318,9 +317,8 @@ class WeaverService : Service() {
         }
 
         // Remap every pointer from panel space into the capture rect
-        // (letterboxed by the safe-area margin, matching the DIBR shader).
-        val pad = safeAreaFrac
-        val span = (1f - 2f * pad).let { if (it <= 0f) 1f else it }
+        // (letterboxed by the safe-area margin, matching the DIBR shader);
+        // see TouchRemap for the exact math (unit-tested).
         val count = ev.pointerCount
         val props = arrayOfNulls<MotionEvent.PointerProperties>(count)
         val coords = arrayOfNulls<MotionEvent.PointerCoords>(count)
@@ -329,10 +327,11 @@ class WeaverService : Service() {
             ev.getPointerProperties(i, p)
             val c = MotionEvent.PointerCoords()
             ev.getPointerCoords(i, c)
-            val u = (((ev.getX(i) + offsetX) / panelW - pad) / span).coerceIn(0f, 1f)
-            val v = (((ev.getY(i) + offsetY) / panelH - pad) / span).coerceIn(0f, 1f)
-            c.x = u * captureW
-            c.y = v * captureH
+            val (mx, my) = TouchRemap.map(
+                ev.getX(i), ev.getY(i), offsetX, offsetY,
+                panelW, panelH, captureW, captureH, safeAreaFrac)
+            c.x = mx
+            c.y = my
             props[i] = p
             coords[i] = c
         }

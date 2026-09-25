@@ -4,16 +4,14 @@ Two apps live in this repo, both targeting the **Leia Lume Pad / Nubia Pad 3D** 
 
 1. **`app` — MC3D**: a self-contained Minecraft-*style* voxel game (three.js, WebXR) that renders
    true stereo on the lightfield via a WebView + WebXR shim + CNSDK interlacer pipeline.
-2. **`weaver` — MC 3D Weaver**: the **whole tablet in glasses-free 3D**. Whatever is on the real
-   screen — Minecraft, the browser, videos, the home screen — is captured, given real depth by
-   an on-device AI pass (MiDaS on the Hexagon NPU), and woven onto the lightfield display.
-   **Everything keeps working natively: two-thumb touch, the on-screen keyboard, and the
-   back / home / recents buttons.**
+2. **`weaver` — MC 3D Weaver**: the **whole tablet in glasses-free 3D**. Pick any app —
+   Minecraft, a browser, a video player — and it runs on a hidden virtual display, is
+   captured, given real depth by an on-device AI pass (MiDaS on the Hexagon NPU), and
+   woven onto the lightfield display. **Everything keeps working natively: two-thumb
+   touch, the on-screen keyboard, and the back / home / recents buttons.**
 
-Pick the APK you want:
-
-- `app/build/outputs/apk/release/app-release.apk` — the voxel game (works on Lume Pad 1/2)
-- `weaver/build/outputs/apk/release/weaver-release.apk` — the whole-tablet 3D weaver (Lume Pad 2)
+Prebuilt release APKs live on [GitHub Releases](../../releases) — they are not committed
+to the repo. Build locally with `./setup.sh` (see "Weaver dev loop" below).
 
 ---
 
@@ -28,20 +26,21 @@ a **hidden virtual display it owns**, captures that display directly (no feedbac
 MediaProjection), and forwards touches into it:
 
 ```
-Shizuku (shell uid) ──► trusted* virtual display + real Android home screen ("3D desktop")
-        │                     ▲
-        │  ImageReader        │  injected MotionEvents (ALL pointers, multi-touch)
-        ▼                     │
+Shizuku (shell uid) ──► virtual display (trusted*) + the selected app
+         │                     ▲
+         │  ImageReader        │  injected MotionEvents (ALL pointers, multi-touch)
+         ▼                     │
 MiDaS depth (Hexagon NPU, ~15-30 Hz) ──► DIBR stereo pair (SBS)
-        │
-        ▼
+         │
+         ▼
 CNSDK InterlacedSurfaceView overlay (fullscreen, NOT_TOUCHABLE)
         └─ weaves the stereo pair onto the lightfield with face tracking
         + a transparent touch-catcher window that forwards every pointer
 ```
 
-- The 3D desktop is a virtual display with its own home screen. Open Minecraft (or anything
-  else) *from that desktop* and it renders in 3D.
+- Pick the app in the weaver UI (Minecraft pinned first); **START 3D** launches it
+  directly onto the hidden virtual display. A running app keeps its state across
+  3D stop/start — no force-stop, so browser tabs and game sessions survive.
 - Touches are captured by a transparent overlay and re-injected as **complete multi-pointer
   events**, so the joystick, look-around drag, and jump/action buttons all work at once.
 - `*` The display is created **TRUSTED** when the shell uid is allowed to (some ROMs, e.g.
@@ -58,14 +57,14 @@ CNSDK InterlacedSurfaceView overlay (fullscreen, NOT_TOUCHABLE)
 2. Install the **Shizuku** app and start it ("Start via Wireless debugging").
 3. Open **MC 3D Weaver** → tap **Fix Shizuku** → allow. Tap **Overlay permission** → allow,
    and allow the camera permission when asked (used by the display's face tracking).
-4. Tap **START 3D** → the home screen appears in 3D (the "3D desktop"). Open Minecraft from
-   it and play. No screen-capture consent prompt is needed.
+4. Tap **START 3D** → the selected app (Minecraft by default) launches in 3D directly.
+   No screen-capture consent prompt is needed.
 5. Shizuku stops when the tablet reboots — reopen Shizuku, tap Start, then START 3D again.
 
 ### Tuning
 
 In the app (adjusts live while 3D runs): **3D depth strength**, **convergence** (where the
-screen plane sits), **screen margin**, **swap eyes** if depth looks inverted, **flip image**
+screen plane sits), **swap eyes** if depth looks inverted, **flip image**
 if the picture renders upside down.
 
 `adb logcat -s WeaverService StereoRenderer DepthEngine Overlay3D` shows pipeline state
@@ -80,6 +79,9 @@ and steady render fps.
 - Depth on the Hexagon NPU is real-time; the XNNPACK CPU fallback is slow — if logcat shows
   `QNN HTP unavailable`, free some memory and retry.
 - The 3D image trails the real screen by roughly 1-3 frames (capture + weave latency).
+- The AI depth is estimated from the flat image, so 2D UI drawn on top of the game —
+  hotbar, buttons, menus — gets depth too and can float. A per-app mask that keeps UI
+  regions flat is future work.
 
 ### Licensing / attribution notes for the weaver
 
@@ -181,6 +183,12 @@ Requirements: JDK 17, Android SDK (platform 35, build-tools). Then:
 ./gradlew :app:assembleRelease   # signed with the debug key for easy sideloading
 ```
 
+### Weaver dev loop
+
+`./setup.sh` builds `:weaver:assembleRelease`, publishes `MC3D-Weaver.apk`, installs it
+on the connected tablet via adb, and re-grants the Shizuku + camera permissions that every
+reinstall revokes. Use `./setup.sh --build` to build without touching the device.
+
 ## Installing on a Lume Pad
 
 ```bash
@@ -218,11 +226,14 @@ app/                       MC3D — the voxel game (WebView + WebXR shim)
 leia-cnsdk/                 local AAR module wrapping the Leia CNSDK 0.7.28 artifact
 weaver/                     MC 3D Weaver — whole-tablet 3D (Lume Pad 2)
   src/main/java/com/leofattal/mcweaver/
-    MainActivity.kt          permissions UI, tuning sliders, start/stop
-    WeaverService.kt         MediaProjection capture + weave orchestration
-    StereoRenderer.kt        EGL + DIBR stereo synthesis into the CNSDK surface
+    MainActivity.kt          permissions UI, app picker, tuning sliders, start/stop
+    WeaverService.kt         virtual-display capture + weave orchestration
+    StereoRenderer.kt         EGL + DIBR stereo synthesis into the CNSDK surface
     DepthEngine.kt           MiDaS w8a8 on the Hexagon NPU (QNN delegate)
-    Overlay3D.kt            CNSDK interlaced pass-through overlay
+    DepthMath.kt             pure depth post-processing (percentiles, dilate, blur)
+    TouchRemap.kt            panel → virtual-display touch mapping
+    Overlay3D.kt             CNSDK interlaced pass-through overlay
+  src/test/java/com/leofattal/mcweaver/   unit tests (DepthMath, TouchRemap)
   src/main/assets/midas_w8a8.tflite   quantized MiDaS depth model
 cnsdk-weaver/               local AAR module wrapping the Leia CNSDK 0.6.167 artifact
 ```
