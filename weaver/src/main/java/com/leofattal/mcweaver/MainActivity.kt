@@ -166,11 +166,6 @@ class MainActivity : Activity() {
         })
         root.addView(makeSeek("convergence", 45) { refreshService() })
 
-        root.addView(TextView(this).apply {
-            text = "Screen margin (0 = fill the screen fully)"
-        })
-        root.addView(makeSeekInt("safeArea", 0, 15) { refreshService() })
-
         root.addView(CheckBox(this).apply {
             text = "Swap eyes (if depth looks inverted)"
             isChecked = prefs.getBoolean("swap", false)
