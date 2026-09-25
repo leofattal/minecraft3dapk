@@ -6,3 +6,7 @@ local.properties
 .DS_Store
 app/build/
 captures/
+
+# Release binaries live on GitHub Releases, not in the repo.
+MC3D-Weaver.apk
+*.cpgz
