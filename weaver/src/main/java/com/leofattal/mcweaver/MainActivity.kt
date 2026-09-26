@@ -39,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var statusText: TextView
     private lateinit var startButton: Button
+    private lateinit var updateButton: Button
 
     /** (label, package) pairs for the app picker; Minecraft pinned first. */
     private var appList: List<Pair<String, String>> = emptyList()
@@ -191,6 +192,12 @@ class MainActivity : Activity() {
         }
         root.addView(startButton)
 
+        updateButton = Button(this).apply {
+            text = "  Update to latest version  "
+            setOnClickListener { onUpdateClicked() }
+        }
+        root.addView(updateButton)
+
         root.addView(TextView(this).apply {
             text = """
                 One-time setup: install the Shizuku app (Play Store) and start
@@ -200,6 +207,10 @@ class MainActivity : Activity() {
                 START 3D launches the selected app onto a hidden 3D display
                 and weaves it in glasses-free 3D. Two-thumb touch works natively,
                 and the hardware BACK key goes to the 3D display.
+
+                "Update to latest version" fetches the newest GitHub release
+                and installs it through Shizuku (stop 3D first; afterwards
+                re-allow Shizuku + camera).
 
                 The app keeps running when you stop: close the pad (turn the
                 screen off) or tap the notification's Stop action to leave 3D.
@@ -271,6 +282,83 @@ class MainActivity : Activity() {
             return
         }
         WeaverService.start(this, prefs.getString("targetPkg", null))
+    }
+
+    // ------------------------------------------------------------------ update
+
+    /** Check GitHub Releases for a newer build; download and install it
+     *  through Shizuku when there is one. */
+    private fun onUpdateClicked() {
+        if (WeaverService.running) {
+            statusText.text = "Stop 3D first (tap STOP 3D) before updating."
+            return
+        }
+        if (!ShellPriv.isShizukuReady()) {
+            statusText.text = "Shizuku not ready — start Shizuku, then update."
+            return
+        }
+        updateButton.isEnabled = false
+        statusText.text = "Checking for updates…"
+        Thread { checkForUpdate() }.start()
+    }
+
+    private fun checkForUpdate() {
+        val current = try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        } catch (_: Throwable) {
+            "?"
+        }
+        val latest = Updater.fetchLatest()
+        if (latest == null) {
+            runOnUiThread {
+                updateButton.isEnabled = true
+                statusText.text = "Update check failed — no release or no APK asset."
+            }
+            return
+        }
+        if (!Updater.isNewer(latest.tag, current)) {
+            runOnUiThread {
+                updateButton.isEnabled = true
+                statusText.text = "Up to date ($current); latest release is ${latest.tag}."
+            }
+            return
+        }
+
+        // Newer release: download, then install as the shell uid.
+        val dest = java.io.File(cacheDir, "update.apk")
+        try {
+            runOnUiThread { statusText.text = "Downloading ${latest.tag}…" }
+            var lastUi = 0L
+            Updater.download(latest.apkUrl, dest) { read, total ->
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastUi > 200) {
+                    lastUi = now
+                    val msg = if (total > 0)
+                        "Downloading ${latest.tag}: ${read / 1048576}/${total / 1048576} MB"
+                    else "Downloading ${latest.tag}: ${read / 1048576} MB"
+                    runOnUiThread { statusText.text = msg }
+                }
+            }
+        } catch (t: Throwable) {
+            runOnUiThread {
+                updateButton.isEnabled = true
+                statusText.text = "Download failed: ${t.message}"
+            }
+            return
+        }
+
+        runOnUiThread { statusText.text = "Installing ${latest.tag}…" }
+        val ok = ShellPriv.installApk(dest)
+        dest.delete()
+        // A successful replace normally kills this process; if we are
+        // still alive the install did not take.
+        runOnUiThread {
+            updateButton.isEnabled = true
+            statusText.text = if (ok)
+                "Installed ${latest.tag} — reopen the app, then tap Fix Shizuku " +
+                "and re-allow the camera (updates revoke runtime grants)."
+            else "Install failed — check that Shizuku is running and retry."
+        }
     }
 
     /** All launchable apps, Minecraft pinned first, alphabetical after. */

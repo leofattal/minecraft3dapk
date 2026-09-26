@@ -375,6 +375,32 @@ object ShellPriv {
 
     // ---------------------------------------------------------------- shell
 
+    /**
+     * Install (replace) an APK by streaming its bytes over stdin via
+     * `pm install -r -S <size>`, running as the shell uid through
+     * Shizuku: an in-app update therefore needs no
+     * REQUEST_INSTALL_PACKAGES / unknown-sources prompt, and the APK
+     * never has to sit in a shell-readable path. Requires the downloaded
+     * APK to be signed with the same key as the installed build (it is:
+     * all release builds use the local debug key).
+     */
+    fun installApk(apk: java.io.File): Boolean {
+        return try {
+            val p = newShellProcess(arrayOf(
+                "pm", "install", "-r", "-S", apk.length().toString()))
+            apk.inputStream().use { input ->
+                val out = p.javaClass.getMethod("getOutputStream")
+                    .invoke(p) as java.io.OutputStream
+                out.use { input.copyTo(it, 64 * 1024) }   // EOF signals -S end
+            }
+            p.javaClass.getMethod("waitFor").invoke(p)
+            p.javaClass.getMethod("exitValue").invoke(p) as Int == 0
+        } catch (t: Throwable) {
+            Log.e(TAG, "installApk failed: ${t.message}", t)
+            false
+        }
+    }
+
     private fun newShellProcess(cmd: Array<String>): Any {
         val m = Shizuku::class.java.getDeclaredMethod(
             "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
