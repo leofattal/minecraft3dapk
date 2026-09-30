@@ -67,6 +67,23 @@ In the app (adjusts live while 3D runs): **3D depth strength**, **convergence** 
 screen plane sits), **swap eyes** if depth looks inverted, **flip image**
 if the picture renders upside down.
 
+### Media playback
+
+Each app has its own **3D mode** (picker under the app list):
+
+- **Depth (AI 3D)** — default; games and ordinary apps get MiDaS-estimated depth.
+  Plain video (VLC, MX Player, gallery) also plays this way.
+- **Flat (2D video)** — zero parallax for plain playback when the AI depth
+  distracts (it re-settles for a second after scene cuts).
+- **SBS 3D passthrough** — for apps showing *true side-by-side 3D content*
+  (SBS 3D movies, 3D camera clips, YouTube "VR" SBS videos in a raw player):
+  each eye is woven straight from its half of the frame with no AI depth, so
+  real stereo comes through intact — and the NPU idles.
+- **DRM streaming** (Netflix, YouTube with Widevine): protected layers are
+  blanked by Android on every capture path; no weaver can show them — use the
+  tablet's own player for those.
+- Video trails its audio by ~1-3 frames (capture + weave latency).
+
 `adb logcat -s WeaverService StereoRenderer DepthEngine Overlay3D` shows pipeline state
 (fps, NPU vs CPU depth). A healthy session logs `depth interpreter running on Hexagon HTP`
 and steady render fps.

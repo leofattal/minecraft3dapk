@@ -36,6 +36,9 @@ class StereoRenderer(
     companion object {
         private const val TAG = "StereoRenderer"
         const val VIEWS = 2
+        const val MODE_DIBR = 0      // AI depth warp (games, ordinary apps)
+        const val MODE_FLAT = 1      // zero parallax — plain 2D video
+        const val MODE_SBS = 2       // frame already holds a true stereo pair
         private const val DEPTH_EVERY = 2   // depth update every Nth frame
         private const val MSG_INIT = 1
         private const val MSG_FRAME = 2
@@ -49,6 +52,9 @@ class StereoRenderer(
     @Volatile var swapEyes = false
     @Volatile var flipY = false           // vertical flip (toggle live if upside down)
     @Volatile var safeArea = 0f         // letterbox fraction (0 = fill screen)
+
+    /** Per-app render mode (see MODE_*); changeable live. */
+    @Volatile var mediaMode = MODE_DIBR
 
     private val appContext = context.applicationContext
     private val sbsW = captureW * VIEWS
@@ -309,10 +315,14 @@ class StereoRenderer(
         // the buffer can go straight back to the pool.
         synchronized(frameLock) { frameBusy[idx] = false }
 
-        // depth input downscale + throttled readback
-        runBlit(frameTex, downscaleFbo, DepthEngine.SIZE, DepthEngine.SIZE, blitProgram)
-        if (depth != null && !depthBusy && frameCounter % DEPTH_EVERY == 0) {
-            dispatchDepth()
+        // depth input downscale + throttled readback — AI depth only; the
+        // flat and SBS-passthrough modes never read uDepth, so the downscale
+        // blit, the readback and the NPU inference are skipped entirely.
+        if (mediaMode == MODE_DIBR) {
+            runBlit(frameTex, downscaleFbo, DepthEngine.SIZE, DepthEngine.SIZE, blitProgram)
+            if (depth != null && !depthBusy && frameCounter % DEPTH_EVERY == 0) {
+                dispatchDepth()
+            }
         }
         frameCounter++
 
@@ -339,6 +349,8 @@ class StereoRenderer(
             GLES30.glGetUniformLocation(program, "uFlipY"), if (flipY) 1f else 0f)
         GLES30.glUniform1f(
             GLES30.glGetUniformLocation(program, "uSafe"), safeArea)
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(program, "uMode"), mediaMode)
 
         bindQuad(program)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
@@ -468,11 +480,17 @@ class StereoRenderer(
     """.trimIndent()
 
     /**
-     * Two-view side-by-side DIBR: each output tile is the captured frame
-     * horizontally reprojected by (depth - convergence) * baseline, with the
-     * two eyes offset in opposite directions. uSafe letterboxes the game
-     * away from the panel edges (better touch accuracy + lightfield sweet
-     * spot) instead of filling the screen.
+     * Two-view side-by-side output with three selectable modes (uMode):
+     *  - MODE_DIBR: each output tile is the captured frame reprojected by
+     *    (depth - convergence) * baseline (the AI-depth "SS3D" weave);
+     *    depth is re-sampled at the shifted position so object edges stay
+     *    clean.
+     *  - MODE_FLAT: both eyes show the same pixel — plain 2D on the panel.
+     *  - MODE_SBS: the captured frame already holds a true stereo pair
+     *    (SBS 3D video) — each eye's tile shows its own half, no AI depth.
+     *
+     * uSafe letterboxes the game away from the panel edges (better touch
+     * accuracy + lightfield sweet spot) instead of filling the screen.
      */
     private val FRAGMENT_SHADER = """
         #version 300 es
@@ -485,6 +503,7 @@ class StereoRenderer(
         uniform float uConvergence;
         uniform float uSwap;
         uniform float uSafe;
+        uniform int uMode;
 
         void main() {
             float tile = floor(vUv.x * 2.0);          // 0 = left tile, 1 = right
@@ -496,21 +515,31 @@ class StereoRenderer(
             }
             u = (u - uSafe) / (1.0 - 2.0 * uSafe);
             v = (v - uSafe) / (1.0 - 2.0 * uSafe);
-            float eye = tile == 0.0 ? 1.0 : -1.0;    // left eye shifts right
-            if (uSwap > 0.5) eye = -eye;
-            // Depth at the OUTPUT pixel only describes where flat-scene
-            // color came from; at object edges the fetched color actually
-            // lives at a different depth, and using the output-pixel depth
-            // smears foreground parallax onto the background. Re-sample the
-            // depth at the shifted position a few times so the parallax
-            // converges to the depth of the color that is actually fetched.
-            float d = texture(uDepth, vec2(u, v)).r;
-            float sx = u;
-            for (int i = 0; i < 3; i++) {
+            float sx;
+            if (uMode == 2) {
+                // SBS passthrough: the frame already holds the true pair —
+                // tile 0 shows the left half, tile 1 the right half.
+                sx = (tile + u) * 0.5;
+            } else if (uMode == 1) {
+                // Flat: both eyes see the same pixel (plain 2D video).
+                sx = u;
+            } else {
+                float eye = tile == 0.0 ? 1.0 : -1.0;    // left eye shifts right
+                if (uSwap > 0.5) eye = -eye;
+                // Depth at the OUTPUT pixel only describes where flat-scene
+                // color came from; at object edges the fetched color actually
+                // lives at a different depth, and using the output-pixel depth
+                // smears foreground parallax onto the background. Re-sample
+                // the depth at the shifted position a few times so the
+                // parallax converges to the depth of the fetched color.
+                float d = texture(uDepth, vec2(u, v)).r;
+                sx = u;
+                for (int i = 0; i < 3; i++) {
+                    sx = clamp(u + eye * uBaseline * (d - uConvergence), 0.0, 1.0);
+                    d = texture(uDepth, vec2(sx, v)).r;
+                }
                 sx = clamp(u + eye * uBaseline * (d - uConvergence), 0.0, 1.0);
-                d = texture(uDepth, vec2(sx, v)).r;
             }
-            sx = clamp(u + eye * uBaseline * (d - uConvergence), 0.0, 1.0);
             vec3 color = texture(uFrame, vec2(sx, v)).rgb;
             frag = vec4(color, 1.0);
         }

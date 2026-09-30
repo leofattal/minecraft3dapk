@@ -104,6 +104,9 @@ class WeaverService : Service() {
     private var weaving = false
     private var screenOffReceiver: BroadcastReceiver? = null
 
+    /** The app this session weaves (drives the per-app 3D mode pref). */
+    private var sessionPkg: String? = null
+
     private val main = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -151,6 +154,11 @@ class WeaverService : Service() {
         // home task forward on display 0, leaving the virtual display black.)
         val targetPkg = intent?.getStringExtra(EXTRA_PKG)
             ?: minecraftPackage(packageManager)
+        sessionPkg = targetPkg
+        // The renderer (and its surface) survive stop/start cycles, so its
+        // parameters — notably the per-app media mode — must be re-applied
+        // for THIS app at every session start.
+        renderer?.let { applyPrefs(it) }
         Thread {
             val ok = targetPkg != null && ShellPriv.launchOnDisplay(targetPkg, displayId)
             Log.i(TAG, "launch $targetPkg on display $displayId -> $ok")
@@ -396,6 +404,13 @@ class WeaverService : Service() {
         rnd.flipY = prefs.getBoolean("flip", false)
         rnd.safeArea = safe
         safeAreaFrac = safe
+        // Per-app media mode: AI depth (default), flat 2D for plain video,
+        // or SBS passthrough when the app shows true side-by-side 3D.
+        rnd.mediaMode = when (prefs.getString("mode:$sessionPkg", "dibr")) {
+            "flat" -> StereoRenderer.MODE_FLAT
+            "sbs" -> StereoRenderer.MODE_SBS
+            else -> StereoRenderer.MODE_DIBR
+        }
     }
 
     // ------------------------------------------------------------------ lifecycle

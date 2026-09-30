@@ -34,12 +34,16 @@ import android.widget.TextView
 class MainActivity : Activity() {
     companion object {
         private const val REQ_CAMERA = 7
+        private val MODE_KEYS = listOf("dibr", "flat", "sbs")
+        private val MODE_LABELS = listOf(
+            "Depth (AI 3D)", "Flat (2D video)", "SBS 3D passthrough")
     }
 
     private lateinit var prefs: SharedPreferences
     private lateinit var statusText: TextView
     private lateinit var startButton: Button
     private lateinit var updateButton: Button
+    private lateinit var modeSpinner: Spinner
 
     /** (label, package) pairs for the app picker; Minecraft pinned first. */
     private var appList: List<Pair<String, String>> = emptyList()
@@ -151,11 +155,35 @@ class MainActivity : Activity() {
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
                     prefs.edit().putString("targetPkg", appList[pos].second).apply()
+                    syncModeSpinner()
                 }
                 override fun onNothingSelected(p: AdapterView<*>?) {}
             }
         }
         root.addView(appSpinner)
+
+        // Per-app 3D mode: AI depth for games/apps, flat for plain video,
+        // SBS passthrough when the app shows true side-by-side 3D content.
+        root.addView(TextView(this).apply {
+            text = "3D mode for this app (media: Flat or SBS)"
+        })
+        modeSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity,
+                android.R.layout.simple_spinner_item, MODE_LABELS).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                    val pkg = prefs.getString("targetPkg", null)
+                        ?: appList.firstOrNull()?.second ?: return
+                    prefs.edit().putString("mode:$pkg", MODE_KEYS[pos]).apply()
+                    refreshService()
+                }
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
+        }
+        root.addView(modeSpinner)
+        syncModeSpinner()
 
         root.addView(TextView(this).apply {
             text = "3D depth strength"
@@ -211,6 +239,12 @@ class MainActivity : Activity() {
                 "Update to latest version" fetches the newest GitHub release
                 and installs it through Shizuku (stop 3D first; afterwards
                 re-allow Shizuku + camera).
+
+                Media: plain video plays with AI depth; pick "Flat (2D
+                video)" for plain playback, or "SBS 3D passthrough" when
+                the app shows side-by-side 3D content (real stereo, no AI).
+                DRM streams (Netflix, YouTube HD) capture black — enforced
+                by Android, not fixable.
 
                 The app keeps running when you stop: close the pad (turn the
                 screen off) or tap the notification's Stop action to leave 3D.
@@ -394,6 +428,16 @@ class MainActivity : Activity() {
 
     private fun refreshService() {
         WeaverService.active?.refreshParams()
+    }
+
+    /** Show the 3D-mode spinner for the currently selected app. */
+    private fun syncModeSpinner() {
+        if (!::modeSpinner.isInitialized) return
+        val pkg = prefs.getString("targetPkg", null)
+            ?: appList.firstOrNull()?.second
+        val key = prefs.getString("mode:$pkg", "dibr") ?: "dibr"
+        val idx = MODE_KEYS.indexOf(key)
+        modeSpinner.setSelection(if (idx >= 0) idx else 0)
     }
 
     private fun refreshStatus() {
