@@ -81,6 +81,11 @@ class Overlay3D(
                 }
             }
         }
+
+        /** The shared, never-closed SDK — also used by VideoActivity,
+         *  which hosts the interlacer in its own window instead of an
+         *  overlay. */
+        fun sdk(context: Context): LeiaSDK? = ensureSdk(context)
     }
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager

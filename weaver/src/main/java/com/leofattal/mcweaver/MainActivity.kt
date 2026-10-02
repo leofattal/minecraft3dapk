@@ -34,6 +34,7 @@ import android.widget.TextView
 class MainActivity : Activity() {
     companion object {
         private const val REQ_CAMERA = 7
+        private const val REQ_PICK_VIDEO = 8
         private val MODE_KEYS = listOf("dibr", "flat", "sbs")
         private val MODE_LABELS = listOf(
             "Depth (AI 3D)", "Flat (2D video)", "SBS 3D passthrough")
@@ -70,6 +71,20 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         rikka.shizuku.Shizuku.removeRequestPermissionResultListener(shizukuListener)
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_PICK_VIDEO && resultCode == RESULT_OK) {
+            val videoUri = data?.data ?: return
+            try {
+                contentResolver.takePersistableUriPermission(videoUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Throwable) {
+            }
+            startActivity(Intent(this, VideoActivity::class.java).setData(videoUri))
+        }
     }
 
     override fun onResume() {
@@ -226,6 +241,17 @@ class MainActivity : Activity() {
         }
         root.addView(updateButton)
 
+        root.addView(Button(this).apply {
+            text = "  Play a video in 3D (local files)  "
+            setOnClickListener {
+                val open = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                open.addCategory(Intent.CATEGORY_OPENABLE)
+                open.setType("video/*")
+                @Suppress("DEPRECATION")
+                startActivityForResult(open, REQ_PICK_VIDEO)
+            }
+        })
+
         root.addView(TextView(this).apply {
             text = """
                 One-time setup: install the Shizuku app (Play Store) and start
@@ -240,11 +266,11 @@ class MainActivity : Activity() {
                 and installs it through Shizuku (stop 3D first; afterwards
                 re-allow Shizuku + camera).
 
-                Media: plain video plays with AI depth; pick "Flat (2D
-                video)" for plain playback, or "SBS 3D passthrough" when
-                the app shows side-by-side 3D content (real stereo, no AI).
-                DRM streams (Netflix, YouTube HD) capture black — enforced
-                by Android, not fixable.
+                Media: "Play a video in 3D" opens the built-in player —
+                SBS/top-bottom 3D files play in TRUE stereo, ordinary
+                files get AI depth. The weaver's per-app mode picker covers
+                apps on the 3D display. DRM streams (Netflix, YouTube HD)
+                capture black — enforced by Android; use your own files.
 
                 The app keeps running when you stop: close the pad (turn the
                 screen off) or tap the notification's Stop action to leave 3D.

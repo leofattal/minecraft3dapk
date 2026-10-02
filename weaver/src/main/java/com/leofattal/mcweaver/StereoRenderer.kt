@@ -39,6 +39,7 @@ class StereoRenderer(
         const val MODE_DIBR = 0      // AI depth warp (games, ordinary apps)
         const val MODE_FLAT = 1      // zero parallax — plain 2D video
         const val MODE_SBS = 2       // frame already holds a true stereo pair
+        const val MODE_TB = 3        // frame holds a top-bottom stereo pair
         private const val DEPTH_EVERY = 2   // depth update every Nth frame
         private const val MSG_INIT = 1
         private const val MSG_FRAME = 2
@@ -515,14 +516,18 @@ class StereoRenderer(
             }
             u = (u - uSafe) / (1.0 - 2.0 * uSafe);
             v = (v - uSafe) / (1.0 - 2.0 * uSafe);
-            float sx;
+            float etile = (uSwap > 0.5) ? (1.0 - tile) : tile;  // eye-swappable
+            vec2 st;
             if (uMode == 2) {
                 // SBS passthrough: the frame already holds the true pair —
                 // tile 0 shows the left half, tile 1 the right half.
-                sx = (tile + u) * 0.5;
+                st = vec2((etile + u) * 0.5, v);
+            } else if (uMode == 3) {
+                // Top-bottom passthrough: top half = left eye.
+                st = vec2(u, (etile + v) * 0.5);
             } else if (uMode == 1) {
                 // Flat: both eyes see the same pixel (plain 2D video).
-                sx = u;
+                st = vec2(u, v);
             } else {
                 float eye = tile == 0.0 ? 1.0 : -1.0;    // left eye shifts right
                 if (uSwap > 0.5) eye = -eye;
@@ -539,8 +544,9 @@ class StereoRenderer(
                     d = texture(uDepth, vec2(sx, v)).r;
                 }
                 sx = clamp(u + eye * uBaseline * (d - uConvergence), 0.0, 1.0);
+                st = vec2(sx, v);
             }
-            vec3 color = texture(uFrame, vec2(sx, v)).rgb;
+            vec3 color = texture(uFrame, st).rgb;
             frag = vec4(color, 1.0);
         }
     """.trimIndent()

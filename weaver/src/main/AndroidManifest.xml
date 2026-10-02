@@ -55,6 +55,22 @@
             </intent-filter>
         </activity>
 
+        <!-- Built-in 3D video player: true stereo for SBS / top-bottom
+             files, AI depth for ordinary ones. Also openable from file
+             managers for any local video. -->
+        <activity
+            android:name=".VideoActivity"
+            android:exported="true"
+            android:label="3D Video Player"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".WeaverService"
             android:exported="false" />

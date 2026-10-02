@@ -69,7 +69,19 @@ if the picture renders upside down.
 
 ### Media playback
 
-Each app has its own **3D mode** (picker under the app list):
+**The built-in 3D video player** ("Play a video in 3D" in the app, or open any local
+video from a file manager → "3D Video Player") decodes the file itself — no capture
+pipeline, so no DRM wall and no audio skew:
+
+- **SBS 3D / top-bottom 3D files play as TRUE stereo** — each eye is woven straight
+  from its own half of the frame, no AI depth. Mode auto-guessed from the file's
+  aspect (wide SBS rips) and switchable live.
+- **Ordinary 2D videos get AI depth** (MiDaS + DIBR), with live mode switching,
+  eye swap, and flip; play/pause + seek controls.
+- Playback needs no Shizuku and no overlay permission — just the camera grant
+  (face tracking) and Leia services.
+
+The weaver path (any app on the hidden display) also has per-app **3D modes**:
 
 - **Depth (AI 3D)** — default; games and ordinary apps get MiDaS-estimated depth.
   Plain video (VLC, MX Player, gallery) also plays this way.
@@ -80,9 +92,10 @@ Each app has its own **3D mode** (picker under the app list):
   each eye is woven straight from its half of the frame with no AI depth, so
   real stereo comes through intact — and the NPU idles.
 - **DRM streaming** (Netflix, YouTube with Widevine): protected layers are
-  blanked by Android on every capture path; no weaver can show them — use the
-  tablet's own player for those.
-- Video trails its audio by ~1-3 frames (capture + weave latency).
+  blanked by Android on every capture path — no weaver can show them — use the
+  built-in player with your own files (or the tablet's own DRM apps).
+- Through the weaver, video trails its audio by ~1-3 frames (capture + weave
+  latency); the built-in player has no such skew.
 
 `adb logcat -s WeaverService StereoRenderer DepthEngine Overlay3D` shows pipeline state
 (fps, NPU vs CPU depth). A healthy session logs `depth interpreter running on Hexagon HTP`
